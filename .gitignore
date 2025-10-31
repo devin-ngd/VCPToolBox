@@ -169,3 +169,5 @@ Plugin/VCPLog/log
 
 # Plugin cache
 Plugin/*/*_cache.json
+
+Plugin/TodoManager/data
