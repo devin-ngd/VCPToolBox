@@ -1,0 +1,99 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "TodoManager",
+  "version": "2.0.0",
+  "displayName": "待办事项管理器",
+  "description": "完全符合VCP设计哲学的待办管理插件。支持自然语言时间、批量操作、智能输出、记忆系统集成。为AI减负，让AI专注于'做什么'而非'怎么调用'。",
+  "author": "VCP Developer",
+  "pluginType": "synchronous",
+  "entryPoint": {
+    "type": "nodejs",
+    "command": "node TodoManager.js"
+  },
+  "communication": {
+    "protocol": "stdio",
+    "timeout": 10000
+  },
+  "configSchema": {
+    "DAILY_REMINDER_TIME": {
+      "type": "string",
+      "description": "每日待办提醒的时间，格式为 HH:mm (24小时制)，例如 09:00",
+      "default": "09:00"
+    },
+    "TIMEZONE": {
+      "type": "string",
+      "description": "时区设置，例如 Asia/Shanghai",
+      "default": "Asia/Shanghai"
+    },
+    "DEFAULT_AGENT_NAME": {
+      "type": "string",
+      "description": "默认AI Agent名称，用于日记记录",
+      "default": "Nova"
+    }
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "commandIdentifier": "CreateTodo",
+        "description": "创建待办事项\n\n🎯 核心理念：统一时间语义，为AI减负\n\n✨ 智能时间解析（支持自然语言）：\n- '今天'、'明天'、'后天'\n- '下周五'、'下个月'\n- '3天后'、'2小时后'\n- '明天下午3点'\n- '周五下午6点'\n- 也支持标准格式：'2025-10-30 15:00'\n\n⏰ 智能提醒：\n- 如果设置了截止时间但未指定提醒，会自动提前15分钟提醒\n- 可通过 remind 参数自定义提醒时间偏移\n- 提醒通过VCP定时任务调度器精确执行\n\n参数：\n- title (必需): 标题\n- when (推荐): 时间（自然语言或标准格式）\n- remind (可选): 提醒偏移，如'提前10分钟'，不指定则默认提前15分钟\n- description (可选): 描述\n- priority (可选): high/medium/low，默认medium\n- tags (可选): 标签，逗号分隔\n- autoLog (可选): true时完成后自动写入日记\n- format (可选): compact/standard/detailed，输出格式",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」CreateTodo「末」,\ntitle:「始」团队会议「末」,\nwhen:「始」明天下午3点「末」,\nremind:「始」提前10分钟「末」,\npriority:「始」high「末」,\nautoLog:「始」true「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "BatchCreate",
+        "description": "批量创建待办（串语法支持）\n\n参数：\n- todos (必需): 待办数组\n- format (可选): 输出格式",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」BatchCreate「末」,\ntodos:「始」[{\"title\": \"买菜\", \"when\": \"今天\"}, {\"title\": \"开会\", \"when\": \"明天3点\"}]「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "ListTodos",
+        "description": "查询待办列表\n\n参数：\n- status (可选): pending/completed/all\n- priority (可选): high/medium/low\n- tag (可选): 按标签筛选\n- dateRange (可选): today/week/month/overdue\n- sortBy (可选): whenTime/priority/createdAt\n- format (可选): compact/standard/detailed，默认compact",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」ListTodos「末」,\nformat:「始」compact「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "UpdateTodo",
+        "description": "修改待办\n\n参数：\n- todoId (必需)\n- when (可选): 新时间（自然语言）\n- remind (可选): 新提醒偏移\n- reflection (可选): 反思内容（完成时）\n- 其他字段（可选）",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」UpdateTodo「末」,\ntodoId:「始」todo_xxx「末」,\nstatus:「始」completed「末」,\nreflection:「始」完成得很顺利「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "BatchUpdate",
+        "description": "批量更新待办\n\n参数：\n- updates (必需): 更新数组",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」BatchUpdate「末」,\nupdates:「始」[{\"todoId\": \"todo_1\", \"status\": \"completed\"}]「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "DeleteTodo",
+        "description": "删除待办。参数: todoId",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」DeleteTodo「末」,\ntodoId:「始」todo_xxx「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "BatchDelete",
+        "description": "批量删除待办\n\n参数：\n- todoIds (必需): ID数组",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」BatchDelete「末」,\ntodoIds:「始」[\"todo_1\", \"todo_2\"]「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "GetTodoDetail",
+        "description": "获取待办详情。参数: todoId, format(可选)",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」GetTodoDetail「末」,\ntodoId:「始」todo_xxx「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "GetDailyTodos",
+        "description": "获取今日待办清单。参数: format(可选)",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」GetDailyTodos「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "RemindTodo",
+        "description": "提醒待办（自动调用）。参数: todoId",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」RemindTodo「末」,\ntodoId:「始」todo_xxx「末」\n<<<[END_TOOL_REQUEST]>>>"
+      }
+    ]
+  },
+  "webSocketPush": {
+    "enabled": true,
+    "messageType": "todo_notification",
+    "usePluginResultAsMessage": true,
+    "targetClientType": "VCPLog"
+  },
+  "daemon": {
+    "enabled": true,
+    "script": "ReminderDaemon.js",
+    "description": "待办提醒守护进程，自动检查并发送待办提醒"
+  }
+}
