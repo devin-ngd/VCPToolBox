@@ -29,6 +29,7 @@ class PluginManager {
         this.isReloading = false;
         this.reloadTimeout = null;
         this.vectorDBManager = null; // 修复：不再自己创建，等待注入
+        this.daemonProcesses = new Map(); // 新增：存储守护进程
     }
 
     setWebSocketServer(wss) {
@@ -61,20 +62,20 @@ class PluginManager {
 
     _getPluginConfig(pluginManifest) {
         const config = {};
-        const globalEnv = process.env; 
-        const pluginSpecificEnv = pluginManifest.pluginSpecificEnvConfig || {}; 
+        const globalEnv = process.env;
+        const pluginSpecificEnv = pluginManifest.pluginSpecificEnvConfig || {};
 
         if (pluginManifest.configSchema) {
             for (const key in pluginManifest.configSchema) {
                 const expectedType = pluginManifest.configSchema[key];
                 let rawValue;
 
-                if (pluginSpecificEnv.hasOwnProperty(key)) { 
+                if (pluginSpecificEnv.hasOwnProperty(key)) {
                     rawValue = pluginSpecificEnv[key];
-                } else if (globalEnv.hasOwnProperty(key)) { 
+                } else if (globalEnv.hasOwnProperty(key)) {
                     rawValue = globalEnv[key];
                 } else {
-                    continue; 
+                    continue;
                 }
 
                 let value = rawValue;
@@ -95,8 +96,8 @@ class PluginManager {
             config.DebugMode = String(pluginSpecificEnv.DebugMode).toLowerCase() === 'true';
         } else if (globalEnv.hasOwnProperty('DebugMode')) {
             config.DebugMode = String(globalEnv.DebugMode).toLowerCase() === 'true';
-        } else if (!config.hasOwnProperty('DebugMode')) { 
-            config.DebugMode = false; 
+        } else if (!config.hasOwnProperty('DebugMode')) {
+            config.DebugMode = false;
         }
         return config;
     }
@@ -106,7 +107,7 @@ class PluginManager {
         if (!pluginManifest) {
             return undefined;
         }
-        const effectiveConfig = this._getPluginConfig(pluginManifest); 
+        const effectiveConfig = this._getPluginConfig(pluginManifest);
         return effectiveConfig ? effectiveConfig[configKey] : undefined;
     }
 
@@ -117,8 +118,8 @@ class PluginManager {
         }
 
         return new Promise((resolve, reject) => {
-            const pluginConfig = this._getPluginConfig(plugin); 
-            const envForProcess = { ...process.env }; 
+            const pluginConfig = this._getPluginConfig(plugin);
+            const envForProcess = { ...process.env };
             for (const key in pluginConfig) {
                 if (pluginConfig.hasOwnProperty(key) && pluginConfig[key] !== undefined) {
                     envForProcess[key] = String(pluginConfig[key]);
@@ -153,11 +154,11 @@ class PluginManager {
                 console.error(`[PluginManager] Failed to start static plugin ${plugin.name}: ${err.message}`);
                 reject(err);
             });
-            
+
             pluginProcess.on('exit', (code, signal) => {
                 processExited = true;
                 clearTimeout(timeoutId);
-                if (signal === 'SIGKILL') { 
+                if (signal === 'SIGKILL') {
                     return;
                 }
                 if (code !== 0) {
@@ -211,6 +212,139 @@ class PluginManager {
                 }
             });
         }
+    }
+
+    /**
+     * 启动插件的守护进程
+     * @param {Object} manifest - 插件清单
+     */
+    startPluginDaemon(manifest) {
+        if (!manifest.daemon || !manifest.daemon.enabled) {
+            return; // 没有配置守护进程或未启用
+        }
+
+        const pluginName = manifest.name;
+        const daemonScript = manifest.daemon.script;
+        const daemonPath = path.join(manifest.basePath, daemonScript);
+
+        // 检查脚本是否存在
+        const fsSync = require('fs');
+        if (!fsSync.existsSync(daemonPath)) {
+            console.warn(`[PluginManager] 守护进程脚本不存在: ${daemonPath}`);
+            return;
+        }
+
+        console.log(`[PluginManager] 启动 ${pluginName} 守护进程: ${daemonScript}`);
+
+        // 启动守护进程
+        const daemonProcess = spawn('node', [daemonPath], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: false,
+            env: {
+                ...process.env,
+                ...manifest.pluginSpecificEnvConfig // 使用插件特定的环境变量
+            },
+            cwd: manifest.basePath // 设置工作目录为插件目录
+        });
+
+        // 监听stdout
+        daemonProcess.stdout.on('data', (data) => {
+            const output = data.toString().trim();
+            if (output) {
+                console.log(`[${pluginName}/Daemon] ${output}`);
+            }
+        });
+
+        // 监听stderr
+        daemonProcess.stderr.on('data', (data) => {
+            const error = data.toString().trim();
+            if (error) {
+                console.error(`[${pluginName}/Daemon] ERROR: ${error}`);
+            }
+        });
+
+        // 监听进程退出
+        daemonProcess.on('exit', (code, signal) => {
+            if (code !== null) {
+                console.log(`[${pluginName}/Daemon] 守护进程退出，退出码: ${code}`);
+            } else if (signal !== null) {
+                console.log(`[${pluginName}/Daemon] 守护进程被信号终止: ${signal}`);
+            }
+            this.daemonProcesses.delete(pluginName);
+        });
+
+        // 监听错误
+        daemonProcess.on('error', (error) => {
+            console.error(`[${pluginName}/Daemon] 启动失败: ${error.message}`);
+            this.daemonProcesses.delete(pluginName);
+        });
+
+        // 保存进程引用
+        this.daemonProcesses.set(pluginName, daemonProcess);
+        console.log(`[${pluginName}/Daemon] ✓ 守护进程已启动 (PID: ${daemonProcess.pid})`);
+    }
+
+    /**
+     * 停止插件的守护进程
+     * @param {string} pluginName - 插件名称
+     */
+    stopPluginDaemon(pluginName) {
+        const daemonProcess = this.daemonProcesses.get(pluginName);
+        if (!daemonProcess) {
+            return; // 没有运行的守护进程
+        }
+
+        console.log(`[PluginManager] 停止 ${pluginName} 守护进程...`);
+        try {
+            daemonProcess.kill('SIGTERM');
+            this.daemonProcesses.delete(pluginName);
+            console.log(`[${pluginName}/Daemon] ✓ 守护进程已停止`);
+        } catch (error) {
+            console.error(`[${pluginName}/Daemon] 停止失败: ${error.message}`);
+        }
+    }
+
+    /**
+     * 停止所有守护进程
+     */
+    async stopAllDaemons() {
+        if (this.daemonProcesses.size === 0) {
+            return;
+        }
+
+        console.log('[PluginManager] 停止所有守护进程...');
+        const stopPromises = [];
+
+        for (const [pluginName, daemonProcess] of this.daemonProcesses.entries()) {
+            stopPromises.push(new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    console.warn(`[${pluginName}/Daemon] 强制终止超时的守护进程`);
+                    try {
+                        daemonProcess.kill('SIGKILL');
+                    } catch (e) {
+                        // 忽略错误
+                    }
+                    resolve();
+                }, 5000); // 5秒超时
+
+                daemonProcess.once('exit', () => {
+                    clearTimeout(timeout);
+                    resolve();
+                });
+
+                try {
+                    daemonProcess.kill('SIGTERM');
+                } catch (error) {
+                    console.error(`[${pluginName}/Daemon] 停止失败: ${error.message}`);
+                    clearTimeout(timeout);
+                    resolve();
+                }
+            }));
+        }
+
+        await Promise.all(stopPromises);
+        this.daemonProcesses.clear();
+        console.log('[PluginManager] 所有守护进程已停止');
     }
 
     async initializeStaticPlugins() {
@@ -285,8 +419,8 @@ class PluginManager {
             if (this.debugMode) console.log('[PluginManager] SciCalculator not found, skipping Python pre-warming.');
         }
     }
-    
-    
+
+
     getPlaceholderValue(placeholder) {
         // First, try the modern, clean key (e.g., "VCPChromePageInfo")
         let entry = this.staticPlaceholderValues.get(placeholder);
@@ -306,7 +440,7 @@ class PluginManager {
         if (typeof entry === 'object' && entry !== null && entry.hasOwnProperty('value')) {
             return entry.value;
         }
-        
+
         // Legacy format: raw string
         if (typeof entry === 'string') {
             return entry;
@@ -338,9 +472,12 @@ class PluginManager {
             return messages;
         }
     }
-    
+
     async shutdownAllPlugins() {
         console.log('[PluginManager] Shutting down all plugins...'); // Keep
+
+        // 新增：停止所有守护进程
+        await this.stopAllDaemons();
 
         // --- Shutdown VectorDBManager first to stop background processing ---
         if (this.vectorDBManager && typeof this.vectorDBManager.shutdown === 'function') {
@@ -409,7 +546,7 @@ class PluginManager {
                         const manifest = JSON.parse(manifestContent);
                         if (!manifest.name || !manifest.pluginType || !manifest.entryPoint) continue;
                         if (this.plugins.has(manifest.name)) continue;
-                        
+
                         manifest.basePath = pluginPath;
                         manifest.pluginSpecificEnvConfig = {};
                         try {
@@ -429,7 +566,7 @@ class PluginManager {
                             try {
                                 const scriptPath = path.join(pluginPath, manifest.entryPoint.script);
                                 const module = require(scriptPath);
-                                
+
                                 modulesToInitialize.push({ manifest, module });
 
                                 if (isPreprocessor && typeof module.processMessages === 'function') {
@@ -467,9 +604,9 @@ class PluginManager {
             } catch (error) {
                 if (error.code !== 'ENOENT') console.error(`[PluginManager] Error reading existing ${PREPROCESSOR_ORDER_FILE}:`, error);
             }
-            
+
             finalOrder.push(...Array.from(availablePlugins).sort());
-            
+
             // 4. 注册预处理器
             for (const pluginName of finalOrder) {
                 this.messagePreprocessors.set(pluginName, discoveredPreprocessors.get(pluginName));
@@ -529,6 +666,15 @@ class PluginManager {
             }
 
             this.buildVCPDescription();
+
+            // 新增：启动所有配置了守护进程的插件
+            console.log('[PluginManager] 检查并启动插件守护进程...');
+            for (const [pluginName, manifest] of this.plugins.entries()) {
+                if (manifest.daemon && manifest.daemon.enabled && !manifest.isDistributed) {
+                    this.startPluginDaemon(manifest);
+                }
+            }
+
             console.log(`[PluginManager] Plugin discovery finished. Loaded ${this.plugins.size} plugins.`);
         } catch (error) {
             if (error.code === 'ENOENT') console.error(`[PluginManager] Plugin directory ${PLUGIN_DIR} not found.`);
@@ -548,7 +694,7 @@ class PluginManager {
                         let commandDescription = `- ${plugin.displayName} (${plugin.name}) - 命令: ${cmd.command || 'N/A'}:\n`; // Assuming cmd might have a 'command' field or similar identifier
                         const indentedCmdDescription = cmd.description.split('\n').map(line => `    ${line}`).join('\n');
                         commandDescription += `${indentedCmdDescription}`;
-                        
+
                         if (cmd.example) {
                             const exampleHeader = `\n  调用示例:\n`;
                             const indentedExample = cmd.example.split('\n').map(line => `    ${line}`).join('\n');
@@ -581,7 +727,7 @@ class PluginManager {
     // getVCPDescription() { // This method is no longer needed as VCPDescription is deprecated
     //     return this.vcpDescription;
     // }
-    
+
     getPlugin(name) {
         return this.plugins.get(name);
     }
@@ -589,7 +735,7 @@ class PluginManager {
     getServiceModule(name) {
         return this.serviceModules.get(name)?.module;
     }
-    
+
     // 新增：获取 VCPLog 插件的推送函数，供其他插件依赖注入
     getVCPLogFunctions() {
         const vcpLogModule = this.getServiceModule('VCPLog');
@@ -667,12 +813,12 @@ class PluginManager {
                 if (!((plugin.pluginType === 'synchronous' || plugin.pluginType === 'asynchronous') && plugin.communication?.protocol === 'stdio')) {
                     throw new Error(`[PluginManager] Local plugin "${toolName}" (type: ${plugin.pluginType}) is not a supported stdio plugin for direct tool call.`);
                 }
-                
+
                 let executionParam = null;
                 if (Object.keys(pluginSpecificArgs).length > 0) {
                     executionParam = JSON.stringify(pluginSpecificArgs);
                 }
-                
+
                 const logParam = executionParam ? (executionParam.length > 100 ? executionParam.substring(0, 100) + '...' : executionParam) : null;
                 if (this.debugMode) console.log(`[PluginManager] Calling local executePlugin for: ${toolName} with prepared param:`, logParam);
 
@@ -696,14 +842,14 @@ class PluginManager {
                     // 检查是否是文件未找到的特定错误
                     if (pluginOutput.code === 'FILE_NOT_FOUND_LOCALLY' && pluginOutput.fileUrl && requestIp) {
                         if (this.debugMode) console.log(`[PluginManager] Plugin '${toolName}' reported local file not found. Attempting to fetch via FileFetcherServer...`);
-                        
+
                         try {
                             const { buffer, mimeType } = await FileFetcherServer.fetchFile(pluginOutput.fileUrl, requestIp);
                             const base64Data = buffer.toString('base64');
                             const dataUri = `data:${mimeType};base64,${base64Data}`;
-                            
+
                             if (this.debugMode) console.log(`[PluginManager] Successfully fetched file as data URI. Retrying plugin call...`);
-                            
+
                             // 新的重试逻辑：精确替换失败的参数
                             const newToolArgs = { ...toolArgs };
                             const failedParam = pluginOutput.failedParameter; // e.g., "image_url1"
@@ -711,7 +857,7 @@ class PluginManager {
                             if (failedParam && newToolArgs[failedParam]) {
                                 // 删除旧的 file:// url 参数
                                 delete newToolArgs[failedParam];
-                                
+
                                 // 添加新的 base64 参数。我们使用一个新的键来避免命名冲突，
                                 // 并且让插件知道这是一个已经处理过的 base64 数据。
                                 // e.g., "image_base64_1"
@@ -719,7 +865,7 @@ class PluginManager {
                                const paramIndex = failedParam.replace('image_url_', '');
                                const newParamKey = `image_base64_${paramIndex}`;
                                newToolArgs[newParamKey] = dataUri;
-                               
+
                                if (this.debugMode) console.log(`[PluginManager] Retrying with '${failedParam}' replaced by '${newParamKey}'.`);
 
                             } else {
@@ -728,7 +874,7 @@ class PluginManager {
                                 newToolArgs.image_base64 = dataUri;
                                 if (this.debugMode) console.log(`[PluginManager] 'failedParameter' not specified. Falling back to replacing 'image_url' with 'image_base64'.`);
                             }
-                            
+
                             // 直接返回重试调用的结果
                             return await this.processToolCall(toolName, newToolArgs, requestIp);
 
@@ -751,7 +897,7 @@ class PluginManager {
                 finalResultObject.MaidName = maidNameFromArgs;
             }
             finalResultObject.timestamp = _getFormattedLocalTimestamp();
-            
+
             return finalResultObject;
 
         } catch (e) {
@@ -762,7 +908,7 @@ class PluginManager {
             } catch (jsonParseError) {
                 errorObject = { plugin_execution_error: e.message || 'Unknown plugin execution error' };
             }
-            
+
             if (maidNameFromArgs && !errorObject.MaidName) {
                 errorObject.MaidName = maidNameFromArgs;
             }
@@ -786,7 +932,7 @@ class PluginManager {
         if (!plugin.entryPoint || !plugin.entryPoint.command) {
             throw new Error(`[PluginManager executePlugin] Entry point command undefined for plugin "${pluginName}".`);
         }
-        
+
         const pluginConfig = this._getPluginConfig(plugin);
         const envForProcess = { ...process.env };
 
@@ -795,7 +941,7 @@ class PluginManager {
                 envForProcess[key] = String(pluginConfig[key]);
             }
         }
-        
+
         const additionalEnv = {};
         if (this.projectBasePath) {
             additionalEnv.PROJECT_BASE_PATH = this.projectBasePath;
@@ -835,7 +981,7 @@ class PluginManager {
             }
             additionalEnv.PLUGIN_NAME_FOR_CALLBACK = pluginName; // Pass the plugin's name
         }
-        
+
         // Force Python stdio encoding to UTF-8
         additionalEnv.PYTHONIOENCODING = 'utf-8';
         const finalEnv = { ...envForProcess, ...additionalEnv };
@@ -857,7 +1003,7 @@ class PluginManager {
             const isAsyncPlugin = plugin.pluginType === 'asynchronous';
 
             const timeoutDuration = plugin.communication.timeout || (isAsyncPlugin ? 1800000 : 60000); // Use manifest timeout, or 30min for async, 1min for sync
-            
+
             const timeoutId = setTimeout(() => {
                 if (!processExited && !initialResponseSent && isAsyncPlugin) {
                     // For async, if initial response not sent by timeout, it's an error for that phase
@@ -934,7 +1080,7 @@ class PluginManager {
                     console.error(`[PluginManager executePlugin Internal] Error after initial response for async plugin "${pluginName}": ${err.message}. Process might have been expected to continue.`);
                 }
             });
-            
+
             pluginProcess.on('exit', (code, signal) => {
                 processExited = true;
                 clearTimeout(timeoutId); // Clear the main timeout once the process exits.
@@ -944,7 +1090,7 @@ class PluginManager {
                     if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" process exited with code ${code}, signal ${signal} after initial response was sent.`);
                     return;
                 }
-                
+
                 // If we are here, it's either a sync plugin, or an async plugin whose initial response was NOT sent before exit.
 
                 if (signal === 'SIGKILL') { // Typically means timeout killed it
@@ -962,7 +1108,7 @@ class PluginManager {
                             console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code 0 but reported error in JSON. Trusting JSON.`);
                         }
                         if (errorOutput.trim()) parsedOutput.pluginStderr = errorOutput.trim();
-                        
+
                         if (!initialResponseSent) resolve(parsedOutput); // Ensure resolve only once
                         else if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Plugin ${pluginName} exited, initial async response already sent.`);
                         return;
@@ -1029,7 +1175,7 @@ class PluginManager {
                     app.use(`/api/plugins/${name}`, pluginRouter);
                     if (this.debugMode) console.log(`[PluginManager] Mounted API routes for ${name} at /api/plugins/${name}`);
                 }
-                
+
                 // VCPLog 特殊处理：注入 WebSocketServer 的广播函数
                 if (name === 'VCPLog' && this.webSocketServer && typeof module.setBroadcastFunctions === 'function') {
                     if (typeof this.webSocketServer.broadcastVCPInfo === 'function') {
@@ -1070,11 +1216,11 @@ class PluginManager {
                 if (this.debugMode) console.warn(`[PluginManager] Distributed tool '${toolManifest.name}' from ${serverId} conflicts with an existing tool. Skipping.`);
                 continue;
             }
-            
+
             // 标记为分布式插件并存储其来源服务器ID
             toolManifest.isDistributed = true;
             toolManifest.serverId = serverId;
-            
+
             // 在显示名称前加上[云端]前缀
             toolManifest.displayName = `[云端] ${toolManifest.displayName || toolManifest.name}`;
 
@@ -1100,7 +1246,7 @@ class PluginManager {
             // 注销后重建描述
             this.buildVCPDescription();
         }
-        
+
         // 新增：清理分布式静态占位符
         this.clearDistributedStaticPlaceholders(serverId);
     }
@@ -1110,16 +1256,16 @@ class PluginManager {
         if (this.debugMode) {
             console.log(`[PluginManager] Updating static placeholders from distributed server ${serverName} (${serverId})`);
         }
-        
+
         for (const [placeholder, value] of Object.entries(placeholders)) {
             // 为分布式占位符添加服务器来源标识
             this.staticPlaceholderValues.set(placeholder, { value: value, serverId: serverId });
-            
+
             if (this.debugMode) {
                 console.log(`[PluginManager] Updated distributed placeholder ${placeholder} from ${serverName}: ${value.substring(0, 100)}${value.length > 100 ? '...' : ''}`);
             }
         }
-        
+
         // 强制日志记录分布式静态占位符更新
         console.log(`[PluginManager] Updated ${Object.keys(placeholders).length} static placeholders from distributed server ${serverName}.`);
     }
@@ -1127,20 +1273,20 @@ class PluginManager {
     // 新增：清理分布式静态占位符
     clearDistributedStaticPlaceholders(serverId) {
         const placeholdersToRemove = [];
-        
+
         for (const [placeholder, entry] of this.staticPlaceholderValues.entries()) {
             if (entry && entry.serverId === serverId) {
                 placeholdersToRemove.push(placeholder);
             }
         }
-        
+
         for (const placeholder of placeholdersToRemove) {
             this.staticPlaceholderValues.delete(placeholder);
             if (this.debugMode) {
                 console.log(`[PluginManager] Removed distributed placeholder ${placeholder} from disconnected server ${serverId}`);
             }
         }
-        
+
         if (placeholdersToRemove.length > 0) {
             console.log(`[PluginManager] Cleared ${placeholdersToRemove.length} static placeholders from disconnected server ${serverId}.`);
         }
@@ -1168,7 +1314,7 @@ class PluginManager {
     }
     startPluginWatcher() {
         if (this.debugMode) console.log('[PluginManager] Starting plugin file watcher...');
-        
+
         const pathsToWatch = [
             path.join(PLUGIN_DIR, '**/plugin-manifest.json'),
             path.join(PLUGIN_DIR, '**/plugin-manifest.json.block')
@@ -1187,7 +1333,7 @@ class PluginManager {
             .on('add', filePath => this.handlePluginManifestChange('add', filePath))
             .on('change', filePath => this.handlePluginManifestChange('change', filePath))
             .on('unlink', filePath => this.handlePluginManifestChange('unlink', filePath));
-            
+
         console.log(`[PluginManager] Chokidar is now watching for manifest changes in: ${PLUGIN_DIR}`);
     }
 
@@ -1196,15 +1342,15 @@ class PluginManager {
             if (this.debugMode) console.log(`[PluginManager] Already reloading, skipping event '${eventType}' for: ${filePath}`);
             return;
         }
-        
+
         clearTimeout(this.reloadTimeout);
-        
+
         if (this.debugMode) console.log(`[PluginManager] Debouncing plugin reload trigger due to '${eventType}' event on: ${path.basename(filePath)}`);
 
         this.reloadTimeout = setTimeout(async () => {
             this.isReloading = true;
             console.log(`[PluginManager] Manifest file change detected ('${eventType}'). Hot-reloading plugins...`);
-            
+
             try {
                 await this.loadPlugins();
                 console.log('[PluginManager] Hot-reload complete.');
@@ -1233,7 +1379,7 @@ pluginManager.getAllPlaceholderValues = function() {
     for (const [key, entry] of this.staticPlaceholderValues.entries()) {
         // Sanitize the key to remove legacy brackets for consistency
         const sanitizedKey = key.replace(/^{{|}}$/g, '');
-        
+
         let value;
         // Handle modern object format
         if (typeof entry === 'object' && entry !== null && entry.hasOwnProperty('value')) {
@@ -1245,7 +1391,7 @@ pluginManager.getAllPlaceholderValues = function() {
             // Fallback for any other unexpected format
             value = `[Invalid format for placeholder ${sanitizedKey}]`;
         }
-        
+
         valuesMap.set(sanitizedKey, value || `[Placeholder ${sanitizedKey} has no value]`);
     }
     return valuesMap;

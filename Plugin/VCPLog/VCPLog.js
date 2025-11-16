@@ -82,7 +82,7 @@ function pushVcpLog(vcpData) {
             // 解析失败，则不添加额外前缀，只记录原始vcpData
         }
     }
-    
+
     writeToLog(logPrefix + mainLogContent);
 }
 
@@ -91,15 +91,17 @@ function pushVcpInfo(infoData) {
     if (pluginConfigInstance && pluginConfigInstance.DebugMode) {
         console.log('[VCPLog] Received VCP Info data for broadcast:', infoData);
     }
-    
-    if (broadcastVCPInfoFunction) {
-        broadcastVCPInfoFunction(infoData);
-    } else if (pluginConfigInstance && pluginConfigInstance.DebugMode) {
-        console.warn('[VCPLog] broadcastVCPInfoFunction is not set. Cannot broadcast VCP Info.');
-    }
-}
 
-// 新增：用于注入 WebSocketServer 的广播函数
+    if (broadcastVCPInfoFunction) {
+        try {
+            broadcastVCPInfoFunction(infoData);
+        } catch (error) {
+            console.error('[VCPLog] × broadcastVCPInfoFunction 调用失败:', error);
+        }
+    } else {
+        console.warn('[VCPLog] ⚠️ broadcastVCPInfoFunction is not set. Cannot broadcast VCP Info.');
+    }
+}// 新增：用于注入 WebSocketServer 的广播函数
 function setBroadcastFunctions(broadcastInfoFunc) {
     broadcastVCPInfoFunction = broadcastInfoFunc;
     if (pluginConfigInstance && pluginConfigInstance.DebugMode) {

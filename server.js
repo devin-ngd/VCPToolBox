@@ -171,7 +171,7 @@ app.use((req, res, next) => {
         if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
             clientIp = clientIp.substr(7);
         }
-        
+
         // 始终记录收到的POST请求IP
         console.log(`[IP Tracker] Received POST request from IP: ${clientIp}`);
 
@@ -301,7 +301,7 @@ const adminAuth = (req, res, next) => {
                     loginAttempts.set(clientIp, attemptInfo);
                 }
             }
-            
+
             res.setHeader('WWW-Authenticate', 'Basic realm="Admin Panel"');
             if (req.path.startsWith('/admin_api') || (req.headers.accept && req.headers.accept.includes('application/json'))) {
                 return res.status(401).json({ error: 'Unauthorized' });
@@ -309,14 +309,14 @@ const adminAuth = (req, res, next) => {
                 return res.status(401).send('<h1>401 Unauthorized</h1><p>Authentication required to access the Admin Panel.</p>');
             }
         }
-        
+
         // 4. 认证成功
         if (clientIp) {
             loginAttempts.delete(clientIp); // 成功后清除尝试记录
         }
         return next();
     }
-    
+
     // 非管理面板路径，继续
     return next();
 };
@@ -354,6 +354,18 @@ app.use((req, res, next) => {
         return next();
     }
 
+    // Skip bearer token check for internal APIs (used by daemon processes)
+    if (req.path.startsWith('/internal/')) {
+        // 验证请求来自本地
+        const clientIp = req.ip || req.connection.remoteAddress;
+        const isLocalhost = clientIp === '::1' || clientIp === '127.0.0.1' || clientIp === '::ffff:127.0.0.1';
+        if (isLocalhost) {
+            return next();
+        }
+        // 非本地请求拒绝访问
+        return res.status(403).json({ error: 'Forbidden (Internal API only accessible from localhost)' });
+    }
+
     const authHeader = req.headers.authorization;
     if (!authHeader || authHeader !== `Bearer ${serverKey}`) {
         return res.status(401).json({ error: 'Unauthorized (Bearer token required)' });
@@ -384,7 +396,7 @@ app.get('/v1/models', async (req, res) => {
             const responseText = await apiResponse.text();
             try {
                 const modelsData = JSON.parse(responseText);
-                
+
                 // 替换模型列表中的内部模型名为公开模型名
                 if (modelsData.data && Array.isArray(modelsData.data)) {
                     modelsData.data = modelsData.data.map(model => {
@@ -400,7 +412,7 @@ app.get('/v1/models', async (req, res) => {
                         return model;
                     });
                 }
-                
+
                 // 设置响应头
                 res.status(apiResponse.status);
                 apiResponse.headers.forEach((value, name) => {
@@ -408,7 +420,7 @@ app.get('/v1/models', async (req, res) => {
                         res.setHeader(name, value);
                     }
                 });
-                
+
                 // 发送修改后的响应
                 res.json(modelsData);
                 return;
@@ -470,9 +482,9 @@ app.post('/v1/schedule_task', async (req, res) => {
     try {
         // 确保目录存在
         await fs.mkdir(VCP_TIMED_CONTACTS_DIR, { recursive: true });
-        
+
         const taskFilePath = path.join(VCP_TIMED_CONTACTS_DIR, `${task_id}.json`);
-        
+
         const scheduledTimeWithOffset = formatToLocalDateTimeWithOffset(targetDate);
 
         const taskData = {
@@ -484,9 +496,9 @@ app.post('/v1/schedule_task', async (req, res) => {
 
         await fs.writeFile(taskFilePath, JSON.stringify(taskData, null, 2));
         if (DEBUG_MODE) console.log(`[Server] 已通过API创建新的定时任务文件: ${taskFilePath}`);
-        
+
         // 返回成功的响应，插件可以基于此生成最终的用户回执
-        res.status(200).json({ 
+        res.status(200).json({
             status: "success",
             message: "任务已成功调度。",
             details: {
@@ -511,18 +523,18 @@ app.post('/v1/interrupt', (req, res) => {
     const context = activeRequests.get(id);
     if (context) {
         console.log(`[Interrupt] Received stop signal for ID: ${id}`);
-        
+
         // 修复 Bug #1, #2, #3: 先设置中止标志，再触发 abort，最后才尝试写入
         // 1. 设置中止标志，防止 chatCompletionHandler 继续写入
         if (!context.aborted) {
             context.aborted = true; // 标记为已中止
-            
+
             // 2. 立即触发 abort 信号（中断正在进行的 fetch 请求）
             if (context.abortController && !context.abortController.signal.aborted) {
                 context.abortController.abort();
                 console.log(`[Interrupt] AbortController.abort() called for ID: ${id}`);
             }
-            
+
             // 3. 等待一小段时间让 abort 传播（避免竞态条件）
             setImmediate(() => {
                 // 4. 现在安全地尝试关闭响应流（如果还未关闭）
@@ -532,7 +544,7 @@ app.post('/v1/interrupt', (req, res) => {
                         if (!context.res.headersSent) {
                             // 修复竞态条件Bug: 根据原始请求的stream属性判断响应类型
                             const isStreamRequest = context.req?.body?.stream === true;
-                            
+
                             if (isStreamRequest) {
                                 // 流式请求：发送SSE格式的中止信号
                                 console.log(`[Interrupt] Sending SSE abort signal for stream request ${id}`);
@@ -540,7 +552,7 @@ app.post('/v1/interrupt', (req, res) => {
                                 context.res.setHeader('Content-Type', 'text/event-stream');
                                 context.res.setHeader('Cache-Control', 'no-cache');
                                 context.res.setHeader('Connection', 'keep-alive');
-                                
+
                                 const abortChunk = {
                                     id: `chatcmpl-interrupt-${Date.now()}`,
                                     object: 'chat.completion.chunk',
@@ -587,7 +599,7 @@ app.post('/v1/interrupt', (req, res) => {
         } else {
             console.log(`[Interrupt] Request ${id} already aborted, skipping duplicate abort.`);
         }
-        
+
         // 向中断请求的发起者返回成功响应
         res.status(200).json({ status: 'success', message: `Interrupt signal sent for request ${id}.` });
     } else {
@@ -681,7 +693,7 @@ app.post('/v1/human/tool', async (req, res) => {
     } catch (error) {
         console.error('[Human Tool Exec] Error processing direct tool call:', error.message);
         handleApiError(req); // 新增：处理API错误计数
-        
+
         let errorObject;
         try {
             // processToolCall 抛出的错误是一个字符串化的JSON
@@ -689,7 +701,7 @@ app.post('/v1/human/tool', async (req, res) => {
         } catch (parseError) {
             errorObject = { error: 'Internal Server Error', details: error.message };
         }
-        
+
         res.status(500).json(errorObject);
     }
 });
@@ -721,9 +733,9 @@ async function handleDiaryFromAIResponse(responseText) {
             successfullyParsedForDiary = true;
         }
     }
-    if (!successfullyParsedForDiary) { 
+    if (!successfullyParsedForDiary) {
         try {
-            const parsedJson = JSON.parse(responseText); 
+            const parsedJson = JSON.parse(responseText);
             const jsonContent = parsedJson.choices?.[0]?.message?.content;
             if (jsonContent && typeof jsonContent === 'string') {
                 fullAiResponseTextForDiary = jsonContent;
@@ -731,7 +743,7 @@ async function handleDiaryFromAIResponse(responseText) {
             }
         } catch (e) { /* ignore */ }
     }
-    if (!successfullyParsedForDiary && !looksLikeSSEForDiary) { 
+    if (!successfullyParsedForDiary && !looksLikeSSEForDiary) {
         fullAiResponseTextForDiary = responseText;
     }
 
@@ -771,7 +783,7 @@ async function handleDiaryFromAIResponse(responseText) {
                         const dailyNoteWriteResponse = pluginResult; // Use pluginResult directly
 
                         if (DEBUG_MODE) console.log(`[handleDiaryFromAIResponse] DailyNoteWrite plugin reported success: ${dailyNoteWriteResponse.message}`);
-                        
+
                         let filePath = '';
                         const successMessage = dailyNoteWriteResponse.message; // e.g., "Diary saved to /path/to/file.txt"
                         const pathMatchMsg = /Diary saved to (.*)/;
@@ -888,6 +900,27 @@ app.post('/plugin-callback/:pluginName/:taskId', async (req, res) => {
     res.status(200).json({ status: "success", message: "Callback received and processed" });
 });
 
+// 新增：内部接口 - 用于守护进程广播消息到 VCPLog 通道
+app.post('/internal/vcplog-broadcast', async (req, res) => {
+    const broadcastData = req.body;
+
+    try {
+        // 通过 WebSocketServer 广播到 VCPLog 通道
+        webSocketServer.broadcast(broadcastData, 'VCPLog');
+
+        res.status(200).json({
+            status: "success",
+            message: "VCPLog broadcast successful"
+        });
+    } catch (error) {
+        console.error(`[Server Internal] × VCPLog 广播失败:`, error);
+        res.status(500).json({
+            status: "error",
+            message: error.message
+        });
+    }
+});
+
 
 async function initialize() {
     console.log('开始初始化向量数据库...');
@@ -900,13 +933,13 @@ async function initialize() {
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
     console.log('插件加载完成。');
-    
+
     console.log('开始初始化服务类插件...');
     // --- 关键顺序调整 ---
     // 必须先将 WebSocketServer 实例注入到 PluginManager，
     // 这样在 initializeServices 内部才能正确地为 VCPLog 等插件注入广播函数。
     pluginManager.setWebSocketServer(webSocketServer);
-    
+
     await pluginManager.initializeServices(app, adminPanelRoutes, __dirname);
     // 在所有服务插件都注册完路由后，再将 adminApiRouter 挂载到主 app 上
     app.use('/admin_api', adminPanelRoutes);
@@ -922,7 +955,7 @@ async function initialize() {
             vcpLogFunctions: pluginManager.getVCPLogFunctions()
         };
         if (DEBUG_MODE) console.log('[Server] Injecting dependencies into plugins...');
-        
+
         // 注入到消息预处理器
         for (const [name, module] of pluginManager.messagePreprocessors) {
             if (typeof module.setDependencies === 'function') {
@@ -983,7 +1016,7 @@ async function initialize() {
          }
     }
     if (DEBUG_MODE) console.log('表情包列表缓存加载完成。');
-    
+
     // 初始化通用任务调度器
     taskScheduler.initialize(pluginManager, webSocketServer, DEBUG_MODE);
 }
@@ -995,16 +1028,16 @@ server = app.listen(port, async () => { // Assign to server variable
     await loadBlacklist(); // 新增：在服务器启动时加载IP黑名单
     console.log(`中间层服务器正在监听端口 ${port}`);
     console.log(`API 服务器地址: ${apiUrl}`);
-    
+
     // 新增：加载模型重定向配置
     console.log('正在加载模型重定向配置...');
     modelRedirectHandler.setDebugMode(DEBUG_MODE);
     await modelRedirectHandler.loadModelRedirectConfig(path.join(__dirname, 'ModelRedirect.json'));
     console.log('模型重定向配置加载完成。');
-    
+
     // ensureDebugLogDir() is effectively handled by initializeServerLogger() synchronously earlier.
     // If ensureDebugLogDirAsync was meant for other purposes, it can be called where needed.
-    
+
     // 新增：初始化Agent管理器
     console.log('正在初始化Agent管理器...');
     await agentManager.initialize(DEBUG_MODE);
@@ -1020,11 +1053,11 @@ server = app.listen(port, async () => { // Assign to server variable
     if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
     const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
     webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
-    
+
     // --- 注入依赖 ---
     // pluginManager.setWebSocketServer(webSocketServer); // 已移动到 initializeServices 之前
     webSocketServer.setPluginManager(pluginManager);
-    
+
     // 初始化 FileFetcherServer
     FileFetcherServer.initialize(webSocketServer);
 
@@ -1036,7 +1069,7 @@ server = app.listen(port, async () => { // Assign to server variable
 
 async function gracefulShutdown() {
     console.log('Initiating graceful shutdown...');
-    
+
     if (taskScheduler) {
         taskScheduler.shutdown();
     }

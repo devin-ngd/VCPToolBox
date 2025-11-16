@@ -99,7 +99,7 @@
 <body>
     <div class="container">
         <h1>VCPLog 通知中心</h1>
-        
+
         <div id="connectionStatus" class="connection-status status-connecting">
             连接状态：连接中...
         </div>
@@ -107,7 +107,7 @@
         <div class="log-container" id="logContainer">
             <p>等待接收 VCP 日志信息...</p>
         </div>
-        
+
         <button onclick="clearLogs()">清空日志</button>
     </div>
 
@@ -116,8 +116,8 @@
     </div>
 
     <script>
-        const VCP_KEY = '123456';
-        const WS_SERVER_URL = 'ws://192.168.2.179:5890'; // 主人您的局域网服务器地址哦！
+        const VCP_KEY = 'nbHFAUJahJpxkBNn';
+        const WS_SERVER_URL = 'ws://127.0.0.1:6005'; // 主人您的局域网服务器地址哦！
         const wsUrl = `${WS_SERVER_URL}/VCPlog/VCP_Key=${VCP_KEY}`;
         let ws;
 
@@ -143,11 +143,11 @@
                 content = `<strong>未知消息：</strong><br>${JSON.stringify(data, null, 2)}`;
             }
             item.innerHTML = `${content}<span class="log-timestamp"> (${timestamp})</span>`;
-            
+
             // 将新消息添加到容器顶部
             logContainer.prepend(item);
             // 确保滚动条在顶部，以便查看最新消息
-            logContainer.scrollTop = 0; 
+            logContainer.scrollTop = 0;
         }
 
         function connectWebSocket() {
@@ -182,14 +182,14 @@
                 console.log('WebSocket Connection Closed:', event);
                 updateStatus('closed', '连接已断开。尝试重连中...');
                 // 尝试重连
-                setTimeout(connectWebSocket, 3000); 
+                setTimeout(connectWebSocket, 3000);
             };
 
             ws.onerror = function(error) {
                 console.error('WebSocket Error:', error);
                 updateStatus('error', '连接发生错误！请检查服务器或网络。');
                 // 错误发生时也尝试重连，但不要过于频繁
-                setTimeout(connectWebSocket, 5000); 
+                setTimeout(connectWebSocket, 5000);
             };
         }
 
