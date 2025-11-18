@@ -97,6 +97,12 @@ class VectorDBManager {
         this.apiUrl = process.env.API_URL;
         this.embeddingModel = process.env.WhitelistEmbeddingModel;
 
+        // ✅ 期望的embedding维度（从环境变量读取，如果设置则强制验证）
+        this.expectedDimensions = process.env.VECTORDB_DIMENSION ? parseInt(process.env.VECTORDB_DIMENSION) : null;
+        
+        // ✅ 缓存embedding维度（初始化时探测一次）
+        this.embeddingDimensions = null;
+
         this.indices = new Map();
         this.chunkMaps = new Map();
         this.activeWorkers = new Set();
@@ -111,6 +117,7 @@ class VectorDBManager {
         // ✅ Tag向量管理器
         this.tagVectorManager = null;
         this.tagVectorEnabled = false;
+        this.tagRAGSystemEnabled = process.env.tagRAGSystem === 'true'; // 🌟 Tag RAG系统总开关
         
         // 🌟 Tag扩展器（毛边网络）
         this.tagExpander = null;
@@ -239,8 +246,91 @@ class VectorDBManager {
         await fs.mkdir(VECTOR_STORE_PATH, { recursive: true });
         await this.storage.initialize();
         
+        // ✅ 初始化时探测embedding维度（金标准）
+        // 🌟 新增：支持VECTORDB_DIMENSION环境变量进行严格验证
+        try {
+            const cachedDimensions = this.storage.getEmbeddingDimensions();
+            
+            // 🌟 如果设置了期望维度，进行严格验证
+            if (this.expectedDimensions) {
+                console.log(`[VectorDB] 🔍 Expected dimensions from config: ${this.expectedDimensions}D`);
+                
+                // 总是进行API探针验证（即使有缓存也要验证）
+                console.log('[VectorDB] Probing API to verify embedding dimensions...');
+                const dummyEmbeddings = await this.getEmbeddingsWithRetry(["."]);
+                
+                if (!dummyEmbeddings || dummyEmbeddings.length === 0) {
+                    throw new Error('Failed to get embedding response from API');
+                }
+                
+                const actualDimensions = dummyEmbeddings[0].length;
+                console.log(`[VectorDB] 📊 API returned dimensions: ${actualDimensions}D`);
+                
+                // ⚠️ 严格验证：实际维度必须匹配期望维度
+                if (actualDimensions !== this.expectedDimensions) {
+                    const errorMsg = `
+╔════════════════════════════════════════════════════════════════╗
+║  ❌ EMBEDDING DIMENSION MISMATCH ERROR                         ║
+╠════════════════════════════════════════════════════════════════╣
+║  Expected: ${this.expectedDimensions}D (from VECTORDB_DIMENSION env var)         ║
+║  Actual:   ${actualDimensions}D (from API response)                     ║
+║                                                                ║
+║  🔍 Possible causes:                                           ║
+║  1. Wrong embedding model configured                           ║
+║  2. API endpoint doesn't support ${this.expectedDimensions}D model            ║
+║  3. Model mismatch (check WhitelistEmbeddingModel)             ║
+║                                                                ║
+║  💡 Solutions:                                                 ║
+║  1. Check your API_URL and WhitelistEmbeddingModel settings    ║
+║  2. Verify the model supports ${this.expectedDimensions}D embeddings           ║
+║  3. Update VECTORDB_DIMENSION to match your model (${actualDimensions}D)       ║
+║  4. Remove VECTORDB_DIMENSION to auto-detect                   ║
+╚════════════════════════════════════════════════════════════════╝
+`;
+                    console.error(errorMsg);
+                    throw new Error(`Dimension mismatch: expected ${this.expectedDimensions}D but got ${actualDimensions}D from API`);
+                }
+                
+                // ✅ 验证通过
+                this.embeddingDimensions = actualDimensions;
+                console.log(`[VectorDB] ✅ Dimension validation passed: ${this.embeddingDimensions}D`);
+                
+                // 更新缓存（如果与缓存不同）
+                if (cachedDimensions !== this.embeddingDimensions) {
+                    this.storage.saveEmbeddingDimensions(this.embeddingDimensions);
+                    console.log(`[VectorDB] 💾 Updated cached dimensions: ${this.embeddingDimensions}D`);
+                }
+                
+            } else {
+                // 🔄 传统模式：自动检测维度（无强制验证）
+                if (cachedDimensions) {
+                    this.embeddingDimensions = cachedDimensions;
+                    console.log(`[VectorDB] ✅ Loaded cached embedding dimensions: ${this.embeddingDimensions}D`);
+                } else {
+                    console.log('[VectorDB] No cached dimensions found, probing API...');
+                    const dummyEmbeddings = await this.getEmbeddingsWithRetry(["."]);
+                    if (dummyEmbeddings && dummyEmbeddings.length > 0) {
+                        this.embeddingDimensions = dummyEmbeddings[0].length;
+                        // ✅ 保存到数据库缓存
+                        this.storage.saveEmbeddingDimensions(this.embeddingDimensions);
+                        console.log(`[VectorDB] ✅ Embedding dimensions detected and cached: ${this.embeddingDimensions}D`);
+                    } else {
+                        throw new Error('Failed to detect embedding dimensions');
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('[VectorDB] Failed to initialize embedding dimensions:', error.message);
+            throw new Error(`Cannot initialize VectorDB: ${error.message}`);
+        }
+        
         // ✅ 初始化Tag向量管理器（异步后台，不阻塞启动）
-        this.initializeTagVectorManager(); // ⚠️ 不使用 await，让它在后台运行
+        if (this.tagRAGSystemEnabled) {
+            console.log('[VectorDB] Tag RAG System is ENABLED');
+            this.initializeTagVectorManager(); // ⚠️ 不使用 await，让它在后台运行
+        } else {
+            console.log('[VectorDB] Tag RAG System is DISABLED (tagRAGSystem=false)');
+        }
         
         await this.scanAndSyncAll();
         await this.cacheDiaryNameVectors();
@@ -253,6 +343,12 @@ class VectorDBManager {
      * ✅ 初始化Tag向量管理器（异步后台构建）
      */
     async initializeTagVectorManager() {
+        // 🌟 双重检查：即使被调用，也要检查开关状态
+        if (!this.tagRAGSystemEnabled) {
+            console.log('[VectorDB] Tag Vector Manager initialization skipped (system disabled)');
+            return;
+        }
+        
         try {
             console.log('[VectorDB] Initializing Tag Vector Manager...');
             
@@ -332,52 +428,72 @@ class VectorDBManager {
 
     async scanAndSyncAll() {
         console.log('[VectorDB] Scanning all diary books for updates...');
-        const diaryBooks = await fs.readdir(DIARY_ROOT_PATH, { withFileTypes: true });
         
-        // ✅ 批量处理，避免并发问题
-        const updateTasks = [];
-        
-        // ✅ 新增：收集当前存在的日记本名称
-        const currentDiaryNames = new Set();
-        
-        for (const dirent of diaryBooks) {
-            if (dirent.isDirectory()) {
-                const diaryName = dirent.name;
-                if (diaryName.startsWith('已整理') || diaryName === 'VCP论坛') {
-                    console.log(`[VectorDB] Ignoring folder "${diaryName}" as it is in the exclusion list.`);
-                    continue;
-                }
-                
-                currentDiaryNames.add(diaryName);
-                const diaryPath = path.join(DIARY_ROOT_PATH, diaryName);
-                
-                const needsUpdate = await this.checkIfUpdateNeeded(diaryName, diaryPath);
-                if (needsUpdate) {
-                    console.log(`[VectorDB] Changes detected in "${diaryName}", will schedule update.`);
-                    updateTasks.push(diaryName);
-                } else {
-                    console.log(`[VectorDB] "${diaryName}" is up-to-date. Index will be loaded on demand.`);
+        try {
+            const diaryBooks = await fs.readdir(DIARY_ROOT_PATH, { withFileTypes: true });
+            
+            // ✅ 批量处理，避免并发问题
+            const updateTasks = [];
+            
+            // ✅ 新增：收集当前存在的日记本名称
+            const currentDiaryNames = new Set();
+            
+            console.log(`[VectorDB] Found ${diaryBooks.length} items in diary root path`);
+            
+            for (const dirent of diaryBooks) {
+                if (dirent.isDirectory()) {
+                    const diaryName = dirent.name;
+                    if (diaryName.startsWith('已整理') || diaryName === 'VCP论坛') {
+                        this.debugLog(`Ignoring folder "${diaryName}" as it is in the exclusion list.`);
+                        continue;
+                    }
+                    
+                    currentDiaryNames.add(diaryName);
+                    const diaryPath = path.join(DIARY_ROOT_PATH, diaryName);
+                    
+                    console.log(`[VectorDB] Checking if update needed for "${diaryName}"...`);
+                    const needsUpdate = await this.checkIfUpdateNeeded(diaryName, diaryPath);
+                    if (needsUpdate) {
+                        console.log(`[VectorDB] Changes detected in "${diaryName}", will schedule update.`);
+                        updateTasks.push(diaryName);
+                    } else {
+                        console.log(`[VectorDB] "${diaryName}" is up-to-date. Index will be loaded on demand.`);
+                    }
                 }
             }
-        }
-        
-        // ✅ 新增：清理数据库中已删除的日记本
-        const dbDiaryNames = this.storage.getAllDiaryNames();
-        for (const dbDiaryName of dbDiaryNames) {
-            if (!currentDiaryNames.has(dbDiaryName)) {
-                console.log(`[VectorDB] Found orphaned database entry for deleted diary "${dbDiaryName}". Cleaning up...`);
-                await this.cleanupDeletedDiary(dbDiaryName);
+            
+            console.log(`[VectorDB] Finished checking all diaries. Found ${updateTasks.length} that need updates.`);
+            
+            // ✅ 新增：清理数据库中已删除的日记本
+            const dbDiaryNames = this.storage.getAllDiaryNames();
+            console.log(`[VectorDB] Checking for orphaned database entries (${dbDiaryNames.length} in DB, ${currentDiaryNames.size} on disk)...`);
+            
+            for (const dbDiaryName of dbDiaryNames) {
+                if (!currentDiaryNames.has(dbDiaryName)) {
+                    console.log(`[VectorDB] Found orphaned database entry for deleted diary "${dbDiaryName}". Cleaning up...`);
+                    await this.cleanupDeletedDiary(dbDiaryName);
+                }
             }
-        }
-        
-        // ✅ 统一调度更新任务
-        console.log(`[VectorDB] Scheduling ${updateTasks.length} diary books for update.`);
-        for (const diaryName of updateTasks) {
-            this.scheduleDiaryBookProcessing(diaryName);
+            
+            // ✅ 统一调度更新任务（非阻塞）
+            console.log(`[VectorDB] Scheduling ${updateTasks.length} diary books for update...`);
+            for (const diaryName of updateTasks) {
+                // ⚠️ 关键修复：不等待调度完成，让它异步执行
+                this.scheduleDiaryBookProcessing(diaryName).catch(err => {
+                    console.error(`[VectorDB] Failed to schedule processing for "${diaryName}":`, err);
+                });
+            }
+            
+            console.log(`[VectorDB] ✅ scanAndSyncAll completed successfully`);
+        } catch (error) {
+            console.error(`[VectorDB] ❌ scanAndSyncAll failed:`, error);
+            throw error;
         }
     }
 
     async checkIfUpdateNeeded(diaryName, diaryPath) {
+        console.log(`[VectorDB] Checking update needed for "${diaryName}"...`);
+        
         // ✅ 检查是否在暂停期
         if (this.storage.isRebuildPaused(diaryName)) {
             this.debugLog(`[VectorDB] Update check for "${diaryName}" is paused`);
@@ -388,9 +504,11 @@ class VectorDBManager {
         const indexPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}.bin`);
         const indexExists = await this.fileExists(indexPath);
         
-        // ✅ 步骤1：检查数据库是否有数据
-        const chunkMap = this.storage.getChunkMap(diaryName);
-        const dbChunkCount = Object.keys(chunkMap).length;
+        console.log(`[VectorDB] Index exists for "${diaryName}": ${indexExists}`);
+        
+        // ✅ 步骤1：检查数据库是否有数据（优化：只获取数量，不加载全部数据）
+        const dbChunkCount = this.storage.getChunkCount(diaryName);
+        console.log(`[VectorDB] Database chunk count for "${diaryName}": ${dbChunkCount}`);
         
         // ✅ 情况1：数据库为空 → Full Rebuild（第一次构建）
         if (dbChunkCount === 0) {
@@ -408,11 +526,14 @@ class VectorDBManager {
 
         // ✅ 步骤3：检查数据一致性（索引 vs 数据库）
         // ⚠️ 关键优化：根据差异大小决定修复策略
+        console.log(`[VectorDB] Checking data consistency for "${diaryName}"...`);
         try {
-            const dimensions = 768;
-            const tempIndex = new HierarchicalNSW('l2', dimensions);
+            // ✅ 使用初始化时缓存的维度（金标准）
+            const tempIndex = new HierarchicalNSW('l2', this.embeddingDimensions);
+            console.log(`[VectorDB] Reading index file for "${diaryName}"...`);
             tempIndex.readIndexSync(indexPath);
             const indexElementCount = tempIndex.getCurrentCount();
+            console.log(`[VectorDB] Index element count for "${diaryName}": ${indexElementCount}`);
             
             if (Math.abs(indexElementCount - dbChunkCount) > 0) {
                 const diff = Math.abs(indexElementCount - dbChunkCount);
@@ -434,8 +555,16 @@ class VectorDBManager {
                 } else {
                     // 差异≤10%：通过diff修复（信任数据库，同步索引）
                     console.log(`[VectorDB] → Minor inconsistency (${diff} chunks), will sync index with database through diff`);
-                    // ✅ 同步修复，确保完成后再继续
+                    // ✅ 关键修复：对大型数据集，异步修复，不阻塞初始化
+                    if (dbChunkCount > 100000) {
+                        console.log(`[VectorDB] ⚠️ Large dataset detected (${dbChunkCount} chunks), skipping sync during initialization`);
+                        console.log(`[VectorDB] Index will be lazily loaded and synced on first use`);
+                        return false; // 延迟修复，不阻塞初始化
+                    }
+                    
+                    // ✅ 小型数据集：同步修复
                     try {
+                        console.log(`[VectorDB] Starting sync for "${diaryName}"...`);
                         await this.syncIndexWithDatabase(diaryName);
                         console.log(`[VectorDB] ✅ Index synced successfully for "${diaryName}"`);
                         return false; // 修复完成，无需触发更新
@@ -779,6 +908,7 @@ class VectorDBManager {
             apiKey: this.apiKey,
             apiUrl: this.apiUrl,
             embeddingModel: this.embeddingModel,
+            expectedDimensions: this.expectedDimensions, // ✅ 传递期望维度给Worker
             retryAttempts: this.config.retryAttempts,
             retryBaseDelay: this.config.retryBaseDelay,
             retryMaxDelay: this.config.retryMaxDelay,
@@ -971,14 +1101,17 @@ class VectorDBManager {
         });
 
         const handleFileChange = (filePath) => {
-            console.log(`[VectorDB] File change detected: ${filePath}`);
+            // ✅ 优化：先提取 diary name，再检查是否应该忽略（避免打印不必要的日志）
             const diaryName = path.basename(path.dirname(filePath));
-            console.log(`[VectorDB] Extracted diary name: "${diaryName}" from path: ${filePath}`);
             
+            // ✅ 提前过滤：如果是排除的文件夹，直接返回，不打印任何日志
             if (diaryName.startsWith('已整理') || diaryName === 'VCP论坛') {
-                console.log(`[VectorDB] Ignoring excluded diary: "${diaryName}"`);
                 return;
             }
+            
+            // ✅ 只有非排除的文件才打印日志
+            console.log(`[VectorDB] File change detected: ${filePath}`);
+            console.log(`[VectorDB] Extracted diary name: "${diaryName}" from path: ${filePath}`);
             
             // ✅ 如果已经在处理中，忽略文件变更
             if (this.activeWorkers.has(diaryName)) {
@@ -1053,18 +1186,19 @@ class VectorDBManager {
 
         watcher
             .on('add', (filePath) => {
-                console.log(`[VectorDB] Event: 'add' - ${filePath}`);
+                // ✅ 优化：不在这里打印日志，交由 handleFileChange 统一处理
                 handleFileChange(filePath);
             })
             .on('change', (filePath) => {
-                console.log(`[VectorDB] Event: 'change' - ${filePath}`);
+                // ✅ 优化：不在这里打印日志，交由 handleFileChange 统一处理
                 handleFileChange(filePath);
             })
             .on('unlink', (filePath) => {
-                console.log(`[VectorDB] Event: 'unlink' - ${filePath}`);
+                // ✅ 优化：不在这里打印日志，交由 handleFileChange 统一处理
                 handleFileChange(filePath);
             })
             .on('unlinkDir', (dirPath) => {
+                // ✅ 目录删除事件仍需打印日志（重要操作）
                 console.log(`[VectorDB] Event: 'unlinkDir' - ${dirPath}`);
                 handleDirUnlink(dirPath);
             });
@@ -1160,6 +1294,12 @@ class VectorDBManager {
     }
 
     async loadIndexForSearch(diaryName, dimensions) {
+        // ✅ 关键修复：在所有操作前检查日记本是否被忽略
+        if (diaryName.startsWith('已整理') || diaryName === 'VCP论坛') {
+            this.debugLog(`[VectorDB] Attempted to load index for ignored diary "${diaryName}". Skipping.`);
+            return false;
+        }
+        
         if (this.indices.has(diaryName)) {
             // ✅ 直接 set，Map 的 set 操作是原子的
             this.lruCache.set(diaryName, { lastAccessed: Date.now() });
@@ -1182,11 +1322,16 @@ class VectorDBManager {
             await fs.access(indexPath);
 
             if (!dimensions) {
-                const dummyEmbeddings = await this.getEmbeddingsWithRetry(["."]);
-                if (!dummyEmbeddings || dummyEmbeddings.length === 0) {
-                    throw new Error("Could not dynamically determine embedding dimensions.");
+                // ✅ 使用缓存的维度（金标准）
+                // 如果内存中丢失，从数据库恢复
+                if (!this.embeddingDimensions) {
+                    this.embeddingDimensions = this.storage.getEmbeddingDimensions();
+                    if (!this.embeddingDimensions) {
+                        throw new Error('Embedding dimensions lost and no cache available');
+                    }
+                    console.warn(`[VectorDB] Recovered embedding dimensions from cache: ${this.embeddingDimensions}`);
                 }
-                dimensions = dummyEmbeddings[0].length;
+                dimensions = this.embeddingDimensions;
             }
 
             const index = new HierarchicalNSW('l2', dimensions);
@@ -1453,12 +1598,44 @@ class VectorDBManager {
                 });
                 
                 // ✅ 修复：回滚数据库（因为索引文件保存失败）
+                let rollbackSuccess = false;
                 try {
                     console.log(`[VectorDB] Rolling back database changes for "${diaryName}"`);
                     this.storage.saveChunks(diaryName, originalChunkMap);
-                    console.log(`[VectorDB] Database rollback successful`);
+                    
+                    // ✅ 验证回滚是否成功
+                    const verifyChunkMap = this.storage.getChunkMap(diaryName);
+                    if (Object.keys(verifyChunkMap).length === Object.keys(originalChunkMap).length) {
+                        console.log(`[VectorDB] ✅ Database rollback successful and verified`);
+                        rollbackSuccess = true;
+                    } else {
+                        throw new Error(`Rollback verification failed: expected ${Object.keys(originalChunkMap).length}, got ${Object.keys(verifyChunkMap).length}`);
+                    }
                 } catch (dbRollbackError) {
-                    console.error(`[VectorDB] Failed to rollback database:`, dbRollbackError.message);
+                    console.error(`[VectorDB] ❌ CRITICAL: Database rollback failed for "${diaryName}":`, dbRollbackError.message);
+                    console.error(`[VectorDB] ⚠️ Data inconsistency detected! Marking for full rebuild.`);
+                    
+                    // ✅ 回滚失败的补救措施：标记需要完整重建
+                    try {
+                        // 删除损坏的索引文件（如果存在）
+                        const safeFileNameBase = Buffer.from(diaryName, 'utf-8').toString('base64url');
+                        const indexPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}.bin`);
+                        if (await this.fileExists(indexPath)) {
+                            await fs.unlink(indexPath);
+                            console.log(`[VectorDB] Deleted inconsistent index file`);
+                        }
+                        
+                        // 清除内存缓存
+                        this.indices.delete(diaryName);
+                        this.chunkMaps.delete(diaryName);
+                        
+                        // 记录失败，触发后续重建
+                        this.storage.recordFailedRebuild(diaryName, `Data inconsistency after rollback failure: ${dbRollbackError.message}`);
+                        
+                        console.error(`[VectorDB] ⚠️ "${diaryName}" marked for full rebuild due to data inconsistency`);
+                    } catch (recoveryError) {
+                        console.error(`[VectorDB] ❌ Recovery attempt also failed:`, recoveryError.message);
+                    }
                 }
                 
                 // 清理临时文件
@@ -1471,7 +1648,12 @@ class VectorDBManager {
                     console.warn(`[VectorDB] Failed to cleanup temp file:`, cleanupError.message);
                 }
                 
-                throw writeError;
+                // ✅ 如果回滚成功，抛出原始错误；如果失败，抛出更严重的错误
+                if (rollbackSuccess) {
+                    throw writeError;
+                } else {
+                    throw new Error(`CRITICAL: Write failed AND rollback failed for "${diaryName}". Full rebuild required. Original error: ${writeError.message}`);
+                }
             }
             
             // ✅ 只有在写入成功后才清理备份
@@ -1620,13 +1802,19 @@ class VectorDBManager {
     async searchWithTagBoost(diaryName, queryVector, k = 3, tagWeight = 0.65) {
         const startTime = performance.now();
         
+        // 🌟 检查Tag RAG系统开关
+        if (!this.tagRAGSystemEnabled) {
+            console.log(`[VectorDB][TagSearch] Tag RAG System disabled, fallback to normal search`);
+            return await this.search(diaryName, queryVector, k);
+        }
+        
         // 如果Tag功能未启用，回退到普通搜索
         if (!this.tagVectorEnabled || !this.tagVectorManager) {
             console.log(`[VectorDB][TagSearch] Tag search disabled, fallback to normal search`);
             return await this.search(diaryName, queryVector, k);
         }
 
-        console.log(`[VectorDB][TagSearch] Starting Tag-enhanced vector search for "${diaryName}" (α=${tagWeight})`);
+        // Tag增强搜索开始（静默）
 
         try {
             // Step 1: Tag层 - 获取语义相关的tags及其向量
@@ -1636,7 +1824,7 @@ class VectorDBManager {
             const scaledTagCount = k * 10;  // 根据k值动态缩放
             const topTagCount = Math.min(Math.max(baseTagCount, scaledTagCount), 100);  // 上限100
             
-            console.log(`[VectorDB][TagSearch] Recalling ${topTagCount} tags for network search (k=${k})`);
+            // Tag召回（静默）
             const matchedTags = await this.tagVectorManager.searchSimilarTags(queryVector, topTagCount);
             
             if (matchedTags.length === 0) {
@@ -1644,8 +1832,7 @@ class VectorDBManager {
                 return await this.search(diaryName, queryVector, k);
             }
 
-            console.log(`[VectorDB][TagSearch] Matched ${matchedTags.length} tags:`,
-                matchedTags.slice(0, 5).map(t => `${t.tag}(${t.score.toFixed(3)})`).join(', '));
+            // 匹配到tags（静默）
 
             // 🌟 Step 1.5: Tag图扩展 - 使用共现网络扩展相关tags
             let expandedTags = matchedTags;
@@ -1655,12 +1842,11 @@ class VectorDBManager {
                     const maxExpansion = parseInt(process.env.TAG_EXPAND_MAX_COUNT) || 30;
                     const minWeight = parseInt(process.env.TAG_EXPAND_MIN_WEIGHT) || 2;
                     
-                    console.log(`[VectorDB][TagSearch] Expanding ${seedTags.length} seed tags via co-occurrence graph (max: ${maxExpansion})...`);
+                    // Tag图扩展（静默）
                     const graphExpanded = await this.tagExpander.expandTags(seedTags, maxExpansion);
                     
                     if (graphExpanded.length > 0) {
-                        console.log(`[VectorDB][TagSearch] Graph expansion found ${graphExpanded.length} related tags:`,
-                            graphExpanded.slice(0, 5).map(t => `${t.tag}(w:${t.weight})`).join(', '));
+                        // 图扩展找到相关tags（静默）
                         
                         // 🌟 合并向量匹配的tags和图扩展的tags
                         // 过滤掉权重过低的扩展tags
@@ -1685,7 +1871,7 @@ class VectorDBManager {
                             }
                         }
                         
-                        console.log(`[VectorDB][TagSearch] Added ${expandedWithVectors.length} graph-expanded tags with vectors`);
+                        // 已添加图扩展tags（静默）
                         
                         // 合并原始匹配tags和扩展tags（去重）
                         const allTagsMap = new Map();
@@ -1697,9 +1883,9 @@ class VectorDBManager {
                         });
                         
                         expandedTags = Array.from(allTagsMap.values());
-                        console.log(`[VectorDB][TagSearch] Total tags after expansion: ${expandedTags.length} (${matchedTags.length} vector + ${expandedWithVectors.length} graph)`);
+                        // Tag扩展完成（静默）
                     } else {
-                        console.log(`[VectorDB][TagSearch] No additional tags from graph expansion`);
+                        // 无额外扩展（静默）
                     }
                 } catch (expandError) {
                     console.error(`[VectorDB][TagSearch] Graph expansion failed:`, expandError.message);
@@ -1708,15 +1894,18 @@ class VectorDBManager {
             }
 
             // Step 2: 向量融合 - 构建Tag增强的查询向量（使用扩展后的tags）
-            // 收集匹配tags的向量（加权平均）
+            // ✅ 解耦：通过新接口批量获取向量，不再直接访问 globalTags
+            const tagNames = expandedTags.map(t => t.tag);
+            const retrievedVectors = await this.tagVectorManager.getVectorsForTags(tagNames);
+
             const tagVectors = [];
             const tagWeights = [];
-            
-            for (const tagInfo of expandedTags) {
-                const tagData = this.tagVectorManager.globalTags.get(tagInfo.tag);
-                if (tagData && tagData.vector) {
-                    tagVectors.push(tagData.vector);
-                    tagWeights.push(tagInfo.score); // 使用相似度作为权重
+
+            for (let i = 0; i < expandedTags.length; i++) {
+                const vector = retrievedVectors[i];
+                if (vector) {
+                    tagVectors.push(vector);
+                    tagWeights.push(expandedTags[i].score); // 使用原始的score作为权重
                 }
             }
 
@@ -1725,7 +1914,7 @@ class VectorDBManager {
                 return await this.search(diaryName, queryVector, k);
             }
 
-            console.log(`[VectorDB][TagSearch] Using ${tagVectors.length} tag vectors for fusion (${expandedTags.length} total tags)`);
+            // Tag向量融合（静默）
 
             // 计算tag向量的加权平均
             const dimensions = queryVector.length;
@@ -1753,13 +1942,12 @@ class VectorDBManager {
                 enhancedQueryVector[i] = (1 - tagWeight) * queryVector[i] + tagWeight * avgTagVector[i];
             }
 
-            console.log(`[VectorDB][TagSearch] Query vector enhanced with ${tagVectors.length} tag vectors (α=${tagWeight})`);
+            // 查询向量已增强（静默）
 
             // Step 3: 使用增强后的向量搜索
             const searchResults = await this.search(diaryName, enhancedQueryVector, k);
 
-            console.log(`[VectorDB][TagSearch] Tag-enhanced search completed in ${(performance.now() - startTime).toFixed(2)}ms`);
-            console.log(`[VectorDB][TagSearch] Found ${searchResults.length} results with tag semantic boost`);
+            console.log(`[VectorDB][TagSearch] Tag增强搜索完成: ${searchResults.length}条结果 (${(performance.now() - startTime).toFixed(0)}ms, ${expandedTags.length}tags)`);
 
             // ✅ 在结果中附加tag信息（包含图扩展信息）
             const enhancedResults = searchResults.map(result => {
@@ -2041,32 +2229,19 @@ class VectorDBManager {
         const usageStats = this.storage.loadUsageStats();
         const sortedDiaries = Object.entries(usageStats)
             .sort(([,a], [,b]) => b.frequency - a.frequency)
-            .map(([name]) => name);
+            .map(([name]) => name)
+            .filter(name => !name.startsWith('已整理') && name !== 'VCP论坛'); // ✅ 过滤掉被忽略的日记本
         
         const preLoadCount = Math.min(this.config.preWarmCount, sortedDiaries.length);
         if (preLoadCount === 0) {
-            console.log('[VectorDB] No usage stats found, skipping pre-warming.');
+            console.log('[VectorDB] No usage stats found for active diaries, skipping pre-warming.');
             return;
         }
         
-        // ✅ 修复：只探测一次dimensions，避免重复向量化
-        let sharedDimensions = null;
-        try {
-            console.log(`[VectorDB] Probing embedding dimensions...`);
-            const dummyEmbeddings = await this.getEmbeddingsWithRetry(["."]);
-            if (dummyEmbeddings && dummyEmbeddings.length > 0) {
-                sharedDimensions = dummyEmbeddings[0].length;
-                console.log(`[VectorDB] ✅ Detected embedding dimensions: ${sharedDimensions} (single probe for all indices)`);
-            }
-        } catch (error) {
-            console.warn(`[VectorDB] ⚠️ Failed to detect dimensions:`, error.message);
-            console.warn(`[VectorDB] Will skip pre-warming and continue startup`);
-            return; // ✅ 失败时直接返回，不阻塞启动
-        }
-        
+        // ✅ 使用缓存的维度（金标准）
         const preLoadPromises = sortedDiaries
             .slice(0, preLoadCount)
-            .map(diaryName => this.loadIndexForSearch(diaryName, sharedDimensions));
+            .map(diaryName => this.loadIndexForSearch(diaryName, this.embeddingDimensions));
         
         await Promise.all(preLoadPromises);
         console.log(`[VectorDB] Pre-warmed ${preLoadCount} most frequently used indices.`);
@@ -2448,6 +2623,11 @@ async function processSingleDiaryBookInWorker(diaryName, config) {
                 const dummyEmbedding = await getEmbeddingsInWorker([prepareTextForEmbedding(dummyText)], config);
                 dimensions = dummyEmbedding[0].length;
                 
+                // ✅ 验证维度
+                if (config.expectedDimensions && dimensions !== config.expectedDimensions) {
+                    throw new Error(`[VectorDB][Worker] Invalid vector dimension. Expected ${config.expectedDimensions}, but got ${dimensions}.`);
+                }
+                
                 index = new HierarchicalNSW('l2', dimensions);
                 index.readIndexSync(indexPath);
                 
@@ -2507,19 +2687,28 @@ async function processSingleDiaryBookInWorker(diaryName, config) {
                     throw new Error(`Embedding count mismatch for file "${file}": expected ${fileChunks.length}, got ${fileVectors.length}`);
                 }
             } catch (error) {
-                // ✅ 特殊处理：遇到429限流错误时优雅退出
-                if (error.isRateLimitError) {
-                    console.warn(`[VectorDB][Worker] ⏸️ Rate limit encountered while processing "${file}"`);
-                    console.warn(`[VectorDB][Worker] Progress saved: ${processedFiles.size}/${relevantFiles.length} files completed`);
-                    console.warn(`[VectorDB][Worker] Next file to process: "${file}"`);
-                    
-                    // 保存当前进度（不包括当前失败的文件）
-                    if (processedFiles.size > 0) {
+                // ✅ 核心修复：在处理任何错误之前，先保存已完成的进度
+                // 这确保了即使发生OOM、系统kill、网络错误等崩溃，已处理的数据也不会丢失
+                console.error(`[VectorDB][Worker] ❌ Error while processing "${file}":`, error.message);
+                
+                if (processedFiles.size > 0 && index) {
+                    console.warn(`[VectorDB][Worker] 💾 Saving progress before handling error...`);
+                    try {
                         await index.writeIndex(indexPath);
                         storage.saveChunks(diaryName, chunkMap);
                         storage.saveBuildProgress(diaryName, Array.from(processedFiles), relevantFiles.length, Array.from(processedFiles).pop());
-                        console.log(`[VectorDB][Worker] ✅ Progress checkpoint saved before rate limit pause`);
+                        console.log(`[VectorDB][Worker] ✅ Progress saved: ${processedFiles.size}/${relevantFiles.length} files (${Object.keys(chunkMap).length} chunks)`);
+                    } catch (saveError) {
+                        console.error(`[VectorDB][Worker] ⚠️ Failed to save progress:`, saveError.message);
+                        // 继续处理原始错误
                     }
+                }
+                
+                // ✅ 然后根据错误类型决定如何处理
+                if (error.isRateLimitError) {
+                    // 限流错误：优雅暂停
+                    console.warn(`[VectorDB][Worker] ⏸️ Rate limit encountered - progress already saved`);
+                    console.warn(`[VectorDB][Worker] Next file to process: "${file}"`);
                     
                     storage.close();
                     
@@ -2529,15 +2718,22 @@ async function processSingleDiaryBookInWorker(diaryName, config) {
                     pauseError.processedFiles = processedFiles.size;
                     pauseError.totalFiles = relevantFiles.length;
                     throw pauseError;
+                } else {
+                    // 其他错误：保存后重新抛出
+                    console.error(`[VectorDB][Worker] ❌ Non-recoverable error. Progress has been saved, will retry from file "${file}" on next run.`);
+                    throw error;
                 }
-                
-                // 其他错误正常抛出
-                throw error;
             }
             
             // ✅ 初始化索引（如果还没有）
             if (!index) {
                 dimensions = fileVectors[0].length;
+                
+                // ✅ 验证维度
+                if (config.expectedDimensions && dimensions !== config.expectedDimensions) {
+                    throw new Error(`[VectorDB][Worker] Invalid vector dimension. Expected ${config.expectedDimensions}, but got ${dimensions}.`);
+                }
+                
                 index = new HierarchicalNSW('l2', dimensions);
                 // ✅ 修复：智能容量预估，支持大规模专业论文集
                 const processedChunkCount = Object.keys(chunkMap).length;

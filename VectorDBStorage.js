@@ -119,6 +119,15 @@ class VectorDBStorage {
             );
         `);
 
+        // ✅ 系统配置表（用于缓存embedding维度等全局配置）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS system_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+        `);
+
         // 失败重建记录表
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS failed_rebuilds (
@@ -311,6 +320,20 @@ class VectorDBStorage {
             };
         }
         return chunkMap;
+    }
+
+    /**
+     * ✅ 高效获取chunk数量（不加载数据）
+     * 专为大型数据集优化，避免加载所有chunk到内存
+     */
+    getChunkCount(diaryName) {
+        this._ensureInitialized();
+        const diaryId = this.getOrCreateDiary(diaryName);
+        const select = this.db.prepare(
+            'SELECT COUNT(*) as count FROM chunks WHERE diary_id = ?'
+        );
+        const result = select.get(diaryId);
+        return result ? result.count : 0;
     }
 
     /**
@@ -650,6 +673,35 @@ class VectorDBStorage {
             'DELETE FROM build_progress WHERE diary_id = ?'
         );
         deleteStmt.run(diaryId);
+    }
+
+    /**
+     * ✅ 保存embedding维度到缓存
+     */
+    saveEmbeddingDimensions(dimensions) {
+        this._ensureInitialized();
+        const now = Date.now();
+        const upsert = this.db.prepare(`
+            INSERT INTO system_config (key, value, updated_at)
+            VALUES ('embedding_dimensions', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        `);
+        upsert.run(String(dimensions), now);
+        console.log(`[VectorDBStorage] Cached embedding dimensions: ${dimensions}`);
+    }
+
+    /**
+     * ✅ 从缓存加载embedding维度
+     */
+    getEmbeddingDimensions() {
+        this._ensureInitialized();
+        const select = this.db.prepare(
+            'SELECT value FROM system_config WHERE key = ?'
+        );
+        const row = select.get('embedding_dimensions');
+        return row ? parseInt(row.value) : null;
     }
 
     /**

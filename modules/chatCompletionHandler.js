@@ -308,10 +308,21 @@ class ChatCompletionHandler {
               },
             ],
           };
-          res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-          res.write('data: [DONE]\n\n', () => {
-            res.end();
-          });
+          try {
+            res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
+            res.write('data: [DONE]\n\n', () => {
+              res.end();
+            });
+          } catch (writeError) {
+            console.error('[Upstream Error] Failed to write error to stream:', writeError.message);
+            if (!res.writableEnded) {
+              try {
+                res.end();
+              } catch (endError) {
+                console.error('[Upstream Error] Failed to end response:', endError.message);
+              }
+            }
+          }
 
           // We are done with this request. Return early.
           return;
@@ -628,10 +639,21 @@ class ChatCompletionHandler {
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
-              res.write('data: [DONE]\n\n', () => {
-                res.end();
-              });
+              try {
+                res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
+                res.write('data: [DONE]\n\n', () => {
+                  res.end();
+                });
+              } catch (writeError) {
+                console.error('[VCP Stream Loop] Failed to write final chunk:', writeError.message);
+                if (!res.writableEnded && !res.destroyed) {
+                  try {
+                    res.end();
+                  } catch (endError) {
+                    console.error('[VCP Stream Loop] Failed to end response:', endError.message);
+                  }
+                }
+              }
             }
             break;
           }
@@ -737,10 +759,21 @@ class ChatCompletionHandler {
                 model: originalBody.model,
                 choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
               };
-              res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
-              res.write('data: [DONE]\n\n', () => {
-                res.end();
-              });
+              try {
+                res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
+                res.write('data: [DONE]\n\n', () => {
+                  res.end();
+                });
+              } catch (writeError) {
+                console.error('[VCP Stream Loop Archery] Failed to write final chunk:', writeError.message);
+                if (!res.writableEnded && !res.destroyed) {
+                  try {
+                    res.end();
+                  } catch (endError) {
+                    console.error('[VCP Stream Loop Archery] Failed to end response:', endError.message);
+                  }
+                }
+              }
             }
             break; // Exit the VCP loop
           }
@@ -1018,10 +1051,21 @@ class ChatCompletionHandler {
               },
             ],
           };
-          res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
-          res.write('data: [DONE]\n\n', () => {
-            res.end();
-          });
+          try {
+            res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
+            res.write('data: [DONE]\n\n', () => {
+              res.end();
+            });
+          } catch (writeError) {
+            console.error('[VCP Stream Loop Max Recursion] Failed to write final chunk:', writeError.message);
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                res.end();
+              } catch (endError) {
+                console.error('[VCP Stream Loop Max Recursion] Failed to end response:', endError.message);
+              }
+            }
+          }
         }
       } else {
         // Non-streaming (originalBody.stream === false)
@@ -1528,8 +1572,19 @@ class ChatCompletionHandler {
           };
         }
 
-        if (!res.writableEnded) {
-          res.send(Buffer.from(JSON.stringify(finalJsonResponse)));
+        if (!res.writableEnded && !res.destroyed) {
+          try {
+            res.send(Buffer.from(JSON.stringify(finalJsonResponse)));
+          } catch (sendError) {
+            console.error('[Non-Stream Response] Failed to send final response:', sendError.message);
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                res.end();
+              } catch (endError) {
+                console.error('[Non-Stream Response] Failed to end response:', endError.message);
+              }
+            }
+          }
         }
         // Handle diary for the *first* AI response in non-streaming mode
         await handleDiaryFromAIResponse(firstResponseRawDataForClientAndDiary);
@@ -1643,10 +1698,21 @@ class ChatCompletionHandler {
               },
             ],
           };
-          res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-          res.write('data: [DONE]\n\n', () => {
-            res.end();
-          });
+          try {
+            res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
+            res.write('data: [DONE]\n\n', () => {
+              res.end();
+            });
+          } catch (writeError) {
+            console.error('[Error Handler Stream] Failed to write error:', writeError.message);
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                res.end();
+              } catch (endError) {
+                console.error('[Error Handler Stream] Failed to end response:', endError.message);
+              }
+            }
+          }
         } else {
           // Non-streaming failure
           res.status(500).json({ error: 'Internal Server Error', details: error.message });
@@ -1657,9 +1723,20 @@ class ChatCompletionHandler {
           '[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.',
         );
         // Send [DONE] marker before ending the stream for graceful termination
-        res.write('data: [DONE]\n\n', () => {
-          res.end();
-        });
+        try {
+          res.write('data: [DONE]\n\n', () => {
+            res.end();
+          });
+        } catch (writeError) {
+          console.error('[Error Handler Stream Cleanup] Failed to write [DONE]:', writeError.message);
+          if (!res.writableEnded && !res.destroyed) {
+            try {
+              res.end();
+            } catch (endError) {
+              console.error('[Error Handler Stream Cleanup] Failed to end response:', endError.message);
+            }
+          }
+        }
       }
     } finally {
       if (id) {

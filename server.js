@@ -591,6 +591,15 @@ app.post('/v1/interrupt', (req, res) => {
                     } catch (e) {
                         console.error(`[Interrupt] Error closing response for ${id}:`, e.message);
                         // 即使写入失败也不要崩溃，只记录错误
+                        // 尝试强制关闭连接以防止挂起
+                        try {
+                            if (context.res && !context.res.destroyed) {
+                                context.res.destroy();
+                                console.log(`[Interrupt] Forcefully destroyed response for ${id}`);
+                            }
+                        } catch (destroyError) {
+                            console.error(`[Interrupt] Error destroying response for ${id}:`, destroyError.message);
+                        }
                     }
                 } else {
                     console.log(`[Interrupt] Response for ${id} already closed or destroyed.`);
@@ -599,6 +608,14 @@ app.post('/v1/interrupt', (req, res) => {
         } else {
             console.log(`[Interrupt] Request ${id} already aborted, skipping duplicate abort.`);
         }
+
+        // 最后从 activeRequests 中移除，防止内存泄漏
+        setTimeout(() => {
+            if (activeRequests.has(id)) {
+                activeRequests.delete(id);
+                console.log(`[Interrupt] Cleaned up request ${id} from activeRequests`);
+            }
+        }, 1000); // 延迟1秒删除，确保所有异步操作完成
 
         // 向中断请求的发起者返回成功响应
         res.status(200).json({ status: 'success', message: `Interrupt signal sent for request ${id}.` });
@@ -929,7 +946,7 @@ async function initialize() {
 
     pluginManager.setProjectBasePath(__dirname);
     pluginManager.setVectorDBManager(vectorDBManager); // 修复：注入 vectorDBManager，避免重复创建
-    
+
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
     console.log('插件加载完成。');
@@ -1100,6 +1117,45 @@ async function gracefulShutdown() {
 
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
+
+// 新增：捕获未处理的异常，防止服务器崩溃
+process.on('uncaughtException', (error) => {
+    console.error('[CRITICAL] Uncaught Exception detected:', error.message);
+    console.error('[CRITICAL] Stack trace:', error.stack);
+
+    // 记录到日志文件
+    const serverLogWriteStream = logger.getLogWriteStream();
+    if (serverLogWriteStream && !serverLogWriteStream.destroyed) {
+        try {
+            serverLogWriteStream.write(
+                `[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] [CRITICAL] Uncaught Exception: ${error.message}\n${error.stack}\n`
+            );
+        } catch (e) {
+            console.error('[CRITICAL] Failed to write exception to log:', e.message);
+        }
+    }
+
+    // 不要立即退出，让服务器继续运行
+    console.log('[CRITICAL] Server will continue running despite the exception.');
+});
+
+// 新增：捕获未处理的 Promise 拒绝
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[WARNING] Unhandled Promise Rejection at:', promise);
+    console.error('[WARNING] Reason:', reason);
+
+    // 记录到日志文件
+    const serverLogWriteStream = logger.getLogWriteStream();
+    if (serverLogWriteStream && !serverLogWriteStream.destroyed) {
+        try {
+            serverLogWriteStream.write(
+                `[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] [WARNING] Unhandled Promise Rejection: ${reason}\n`
+            );
+        } catch (e) {
+            console.error('[WARNING] Failed to write rejection to log:', e.message);
+        }
+    }
+});
 
 // Ensure log stream is flushed on uncaught exceptions or synchronous exit, though less reliable
 process.on('exit', (code) => {

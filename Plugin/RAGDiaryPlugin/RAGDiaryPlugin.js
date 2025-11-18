@@ -727,9 +727,15 @@ class RAGDiaryPlugin {
             }
 
             if (!queryVector) {
-                console.error('[RAGDiaryPlugin] 查询向量化失败，跳过RAG处理。');
-                console.error('[RAGDiaryPlugin] userContent length:', userContent?.length);
-                console.error('[RAGDiaryPlugin] aiContent length:', aiContent?.length);
+                // 检查是否是系统提示导致的空内容（这是正常情况）
+                const isSystemPrompt = !userContent || userContent.length === 0;
+                if (isSystemPrompt) {
+                    console.log('[RAGDiaryPlugin] 检测到系统提示消息，无需向量化，跳过RAG处理。');
+                } else {
+                    console.error('[RAGDiaryPlugin] 查询向量化失败，跳过RAG处理。');
+                    console.error('[RAGDiaryPlugin] userContent length:', userContent?.length);
+                    console.error('[RAGDiaryPlugin] aiContent length:', aiContent?.length);
+                }
                 // 安全起见，移除所有占位符
                 const newMessages = JSON.parse(JSON.stringify(messages));
                 for (const index of targetSystemMessageIndices) {
@@ -807,7 +813,7 @@ class RAGDiaryPlugin {
             const placeholder = match[0];
             const modifiersAndParams = match[1] || '';
             
-            console.log(`[RAGDiaryPlugin] 检测到VCP元思考占位符: ${placeholder}`);
+            // 静默处理元思考占位符
 
             // 解析参数：链名称、修饰符和K值序列
             // 格式: [[VCP元思考:<链名称>::<修饰符>:<k1-k2-k3-k4-k5>]]
@@ -861,7 +867,7 @@ class RAGDiaryPlugin {
                 }
             }
 
-            console.log(`[RAGDiaryPlugin] 元思考参数: 链名称="${chainName}", 自动模式=${isAutoMode}, 阈值=${autoThreshold}, 使用语义组=${useGroup}, K序列=[${kSequence.join(',')}]`);
+            // 参数已解析，开始处理
 
             try {
                 const metaResult = await this._processMetaThinkingChain(
@@ -876,7 +882,7 @@ class RAGDiaryPlugin {
                 );
                 
                 processedContent = processedContent.replace(placeholder, metaResult);
-                console.log(`[RAGDiaryPlugin] VCP元思考链处理完成`);
+                // 元思考链处理完成（静默）
             } catch (error) {
                 console.error(`[RAGDiaryPlugin] 处理VCP元思考链时发生错误:`, error);
                 processedContent = processedContent.replace(
@@ -1104,9 +1110,7 @@ class RAGDiaryPlugin {
         const tagMemoMatch = modifiers.match(/::TagMemo([\d.]+)/);
         const tagWeight = tagMemoMatch ? parseFloat(tagMemoMatch[1]) : null;
         
-        if (tagWeight !== null) {
-            console.log(`[RAGDiaryPlugin] 检测到TagMemo修饰符，权重=${tagWeight}`);
-        }
+        // TagMemo修饰符检测（静默）
 
         const displayName = dbName + '日记本';
         const finalK = Math.max(1, Math.round(dynamicK * kMultiplier));
@@ -1283,7 +1287,7 @@ class RAGDiaryPlugin {
             // 两种模式都应该尊重链本身定义的k序列
             const k = kSequence[i];
             
-            console.log(`[RAGDiaryPlugin][MetaThinking] 阶段 ${i + 1}/${chain.length}: 查询"${clusterName}"，k=${k}`);
+            // 静默查询阶段 ${i + 1}/${chain.length}
 
             try {
                 // 使用当前查询向量搜索当前簇
@@ -1328,7 +1332,7 @@ class RAGDiaryPlugin {
                             [queryVector, avgResultVector],
                             [0.8, 0.2]
                         );
-                        console.log(`[RAGDiaryPlugin][MetaThinking] 向量已融合，准备进入下一阶段`);
+                        // 向量融合完成（静默）
                     } else {
                         console.warn(`[RAGDiaryPlugin][MetaThinking] 无法获取结果向量，中断递归`);
                         break;
@@ -1360,7 +1364,7 @@ class RAGDiaryPlugin {
                     totalStages: chain.length
                 };
                 this.pushVcpInfo(infoData);
-                console.log(`[RAGDiaryPlugin][MetaThinking] VCP Info 已广播`);
+                // VCP Info 已广播（静默）
             } catch (broadcastError) {
                 console.error(`[RAGDiaryPlugin][MetaThinking] VCP Info 广播失败:`, broadcastError);
             }
@@ -1583,7 +1587,7 @@ class RAGDiaryPlugin {
             console.warn('[RAGDiaryPlugin] Rerank called, but is not configured. Skipping.');
             return documents.slice(0, originalK);
         }
-        console.log(`[RAGDiaryPlugin] Starting rerank process for ${documents.length} documents.`);
+        // Rerank开始（静默）
 
         const rerankUrl = new URL('v1/rerank', this.rerankConfig.url).toString();
         const headers = {
@@ -1615,7 +1619,7 @@ class RAGDiaryPlugin {
             batches.push(currentBatch);
         }
 
-        console.log(`[RAGDiaryPlugin] Split documents into ${batches.length} batches for reranking.`);
+        // 文档已分批（静默）
 
         let allRerankedDocs = [];
         for (let i = 0; i < batches.length; i++) {
@@ -1630,7 +1634,7 @@ class RAGDiaryPlugin {
                     top_n: docTexts.length // Rerank all documents within the batch
                 };
 
-                console.log(`[RAGDiaryPlugin] Reranking batch ${i + 1}/${batches.length} with ${docTexts.length} documents.`);
+                // Reranking批次 ${i + 1}/${batches.length}（静默）
                 const response = await axios.post(rerankUrl, body, { headers });
 
                 if (response.data && Array.isArray(response.data.results)) {
@@ -1663,7 +1667,7 @@ class RAGDiaryPlugin {
         allRerankedDocs.sort((a, b) => b.rerank_score - a.rerank_score);
 
         const finalDocs = allRerankedDocs.slice(0, originalK);
-        console.log(`[RAGDiaryPlugin] Rerank process finished. Returning ${finalDocs.length} documents.`);
+        console.log(`[RAGDiaryPlugin] Rerank完成: ${finalDocs.length}篇文档`);
         return finalDocs;
     }
     
