@@ -171,3 +171,9 @@ Plugin/VCPLog/log
 Plugin/*/*_cache.json
 
 Plugin/TodoManager/data
+Plugin/MCPOMonitor/mcpo_status_cache.txt
+Plugin/DailyHot/dailyhot_cache.md
+ip_blacklist.json
+Plugin/IMAPIndex/mail_store/uid.index
+VCPTimedContacts/todo_remind_todo*.json
+Plugin/UserAuth/code.bin
