@@ -2,70 +2,15 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use usearch::Index;
+use rusqlite::Connection;
 
-/// Mapping结构：Tag文本 <-> Label数字
-#[derive(Serialize, Deserialize)]
-struct Mapping {
-    label_to_tag: HashMap<u32, String>,
-    tag_to_label: HashMap<String, u32>,
-    #[serde(skip)]
-    next_label: AtomicU32,
-}
-
-impl Clone for Mapping {
-    fn clone(&self) -> Self {
-        let next_val = self.next_label.load(Ordering::SeqCst);
-        Self {
-            label_to_tag: self.label_to_tag.clone(),
-            tag_to_label: self.tag_to_label.clone(),
-            next_label: AtomicU32::new(next_val),
-        }
-    }
-}
-
-impl Mapping {
-    fn new() -> Self {
-        Self {
-            label_to_tag: HashMap::new(),
-            tag_to_label: HashMap::new(),
-            next_label: AtomicU32::new(0),
-        }
-    }
-
-    fn get_or_create_label(&mut self, tag: &str) -> u32 {
-        if let Some(&label) = self.tag_to_label.get(tag) {
-            return label;
-        }
-
-        let new_label = self.next_label.fetch_add(1, Ordering::SeqCst);
-        self.tag_to_label.insert(tag.to_string(), new_label);
-        self.label_to_tag.insert(new_label, tag.to_string());
-        new_label
-    }
-
-    fn get_tag(&self, label: u32) -> Option<&String> {
-        self.label_to_tag.get(&label)
-    }
-
-    fn remove(&mut self, tag: &str) -> Option<u32> {
-        if let Some(label) = self.tag_to_label.remove(tag) {
-            self.label_to_tag.remove(&label);
-            Some(label)
-        } else {
-            None
-        }
-    }
-}
-
-/// 搜索结果
+/// 搜索结果 (返回 ID 而非 Tag 文本)
+/// 上层 JS 会拿着 ID 去 SQLite 里查具体的文本内容
 #[napi(object)]
 pub struct SearchResult {
-    pub tag: String,
+    pub id: u32,   // 对应 SQLite 中的 chunks.id 或 tags.id
     pub score: f64,
 }
 
@@ -78,11 +23,10 @@ pub struct VexusStats {
     pub memory_usage: u32,
 }
 
-/// 核心索引结构
+/// 核心索引结构 (无状态，只存向量)
 #[napi]
 pub struct VexusIndex {
     index: Arc<RwLock<Index>>,
-    mapping: Arc<RwLock<Mapping>>,
     dimensions: u32,
 }
 
@@ -93,7 +37,7 @@ impl VexusIndex {
     pub fn new(dim: u32, capacity: u32) -> Result<Self> {
         let index = Index::new(&usearch::IndexOptions {
             dimensions: dim as usize,
-            metric: usearch::MetricKind::L2sq,
+            metric: usearch::MetricKind::L2sq, // 余弦相似度通常用 L2sq 或 Cosine (如果是归一化向量，L2sq 等价于 Cosine)
             quantization: usearch::ScalarKind::F32,
             connectivity: 16,
             expansion_add: 128,
@@ -108,29 +52,19 @@ impl VexusIndex {
 
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
-            mapping: Arc::new(RwLock::new(Mapping::new())),
             dimensions: dim,
         })
     }
 
-    /// ✅ 修复：从磁盘加载索引（增加capacity参数）
+    /// 从磁盘加载索引
+    /// 注意：移除了 map_path，因为映射关系现在由 SQLite 管理
     #[napi(factory)]
-    pub fn load(index_path: String, map_path: String, dim: u32, capacity: u32) -> Result<Self> {
-        // 读取映射文件
-        let map_data = std::fs::read(&map_path)
-            .map_err(|e| Error::from_reason(format!("Failed to read mapping: {}", e)))?;
+    pub fn load(index_path: String, _unused_map_path: Option<String>, dim: u32, capacity: u32) -> Result<Self> {
+        // 为了保持 JS 调用签名兼容，保留了 map_path 参数但忽略它
+        // 或者你可以修改 JS 里的调用去掉第二个参数
 
-        let mut mapping: Mapping = bincode::deserialize(&map_data)
-            .map_err(|e| Error::from_reason(format!("Failed to deserialize mapping: {}", e)))?;
-
-        // 恢复next_label计数器
-        if !mapping.label_to_tag.is_empty() {
-            let max_label = *mapping.label_to_tag.keys().max().unwrap();
-            mapping.next_label = AtomicU32::new(max_label + 1);
-        }
-
-        // 创建临时索引并加载
-        let temp_index = Index::new(&usearch::IndexOptions {
+        // 创建空索引配置
+        let index = Index::new(&usearch::IndexOptions {
             dimensions: dim as usize,
             metric: usearch::MetricKind::L2sq,
             quantization: usearch::ScalarKind::F32,
@@ -139,224 +73,174 @@ impl VexusIndex {
             expansion_search: 64,
             multi: false,
         })
-        .map_err(|e| Error::from_reason(format!("Failed to create temp index: {:?}", e)))?;
+        .map_err(|e| Error::from_reason(format!("Failed to create index wrapper: {:?}", e)))?;
 
-        // 加载索引文件
-        temp_index.load(&index_path)
-            .map_err(|e| Error::from_reason(format!("Failed to load index: {:?}", e)))?;
+        // 加载二进制文件
+        index.load(&index_path)
+            .map_err(|e| Error::from_reason(format!("Failed to load index from disk: {:?}", e)))?;
 
-        // ✅ 关键修复：加载后立即扩容到目标容量
-        let current_capacity = temp_index.capacity();
+        // 检查容量并扩容
+        let current_capacity = index.capacity();
         if capacity as usize > current_capacity {
-            eprintln!("[Vexus] Expanding capacity: {} -> {}", current_capacity, capacity);
-            temp_index
+            // eprintln!("[Vexus] Expanding capacity on load: {} -> {}", current_capacity, capacity);
+            index
                 .reserve(capacity as usize)
-                .map_err(|e| Error::from_reason(format!("Failed to expand capacity after load: {:?}", e)))?;
+                .map_err(|e| Error::from_reason(format!("Failed to expand capacity: {:?}", e)))?;
         }
 
-        let dimensions = temp_index.dimensions() as u32;
-
         Ok(Self {
-            index: Arc::new(RwLock::new(temp_index)),
-            mapping: Arc::new(RwLock::new(mapping)),
-            dimensions,
+            index: Arc::new(RwLock::new(index)),
+            dimensions: dim,
         })
     }
 
-    /// 保存到磁盘
+    /// 保存索引到磁盘
     #[napi]
-    pub fn save(&self, index_path: String, map_path: String) -> Result<()> {
-        let mapping = self.mapping.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
-        let map_data = bincode::serialize(&*mapping)
-            .map_err(|e| Error::from_reason(format!("Failed to serialize mapping: {}", e)))?;
-
-        // 保存映射（临时文件 + 重命名）
-        let temp_map_path = format!("{}.tmp", map_path);
-        std::fs::write(&temp_map_path, &map_data)
-            .map_err(|e| Error::from_reason(format!("Failed to write mapping temp: {}", e)))?;
-
-        std::fs::rename(&temp_map_path, &map_path)
-            .map_err(|e| Error::from_reason(format!("Failed to rename mapping: {}", e)))?;
-
-        // 保存索引
+    pub fn save(&self, index_path: String) -> Result<()> {
         let index = self.index.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
-        let temp_index_path = format!("{}.tmp", index_path);
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
+        
+        // 原子写入：先写临时文件，再重命名
+        let temp_path = format!("{}.tmp", index_path);
 
         index
-            .save(&temp_index_path)
+            .save(&temp_path)
             .map_err(|e| Error::from_reason(format!("Failed to save index: {:?}", e)))?;
 
-        std::fs::rename(&temp_index_path, &index_path)
-            .map_err(|e| Error::from_reason(format!("Failed to rename index: {}", e)))?;
+        std::fs::rename(&temp_path, &index_path)
+            .map_err(|e| Error::from_reason(format!("Failed to rename index file: {}", e)))?;
 
         Ok(())
     }
 
-    /// ✅ 修复：批量添加/更新向量（增加容量检查和自动扩容）
+    /// 单个添加 (JS 循环调用)
     #[napi]
-    pub fn upsert(&self, tags: Vec<String>, vectors: Buffer) -> Result<()> {
-        let mut mapping = self.mapping.write()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire write lock: {}", e)))?;
+    pub fn add(&self, id: u32, vector: Buffer) -> Result<()> {
         let index = self.index.write()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire write lock: {}", e)))?;
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
 
-        // 将Buffer转换为f32数组
-        let vec_data: &[f32] = unsafe {
+        let vec_slice: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                vector.as_ptr() as *const f32,
+                vector.len() / std::mem::size_of::<f32>(),
+            )
+        };
+
+        if vec_slice.len() != self.dimensions as usize {
+            return Err(Error::from_reason(format!(
+                "Dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                vec_slice.len()
+            )));
+        }
+
+        // 自动扩容检查
+        if index.size() + 1 >= index.capacity() {
+             let new_cap = (index.capacity() as f64 * 1.5) as usize;
+             let _ = index.reserve(new_cap);
+        }
+
+        index
+            .add(id as u64, vec_slice)
+            .map_err(|e| Error::from_reason(format!("Add failed: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    /// 批量添加 (更高效，建议未来 JS 改用此接口)
+    #[napi]
+    pub fn add_batch(&self, ids: Vec<u32>, vectors: Buffer) -> Result<()> {
+        let index = self.index.write()
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
+
+        let count = ids.len();
+        let dim = self.dimensions as usize;
+        
+        let vec_slice: &[f32] = unsafe {
             std::slice::from_raw_parts(
                 vectors.as_ptr() as *const f32,
                 vectors.len() / std::mem::size_of::<f32>(),
             )
         };
 
-        let vec_dim = self.dimensions as usize;
-        let num_vectors = tags.len();
-
-        if vec_data.len() != num_vectors * vec_dim {
-            return Err(Error::from_reason(format!(
-                "Vector data size mismatch: expected {} floats, got {}",
-                num_vectors * vec_dim,
-                vec_data.len()
-            )));
+        if vec_slice.len() != count * dim {
+             return Err(Error::from_reason("Batch size mismatch".to_string()));
         }
 
-        // ✅ 关键修复：容量检查和自动扩容
-        let current_size = index.size();
-        let current_capacity = index.capacity();
-        let required_capacity = current_size + num_vectors;
-
-        if required_capacity > current_capacity {
-            // 扩容到需求的1.5倍（留余量）
-            let new_capacity = (required_capacity as f64 * 1.5) as usize;
-            eprintln!(
-                "[Vexus] Auto-expanding: {}/{} -> capacity {}",
-                current_size, current_capacity, new_capacity
-            );
-            
-            index
-                .reserve(new_capacity)
-                .map_err(|e| Error::from_reason(format!(
-                    "Failed to expand capacity from {} to {}: {:?}",
-                    current_capacity, new_capacity, e
-                )))?;
+        // 预扩容
+        if index.size() + count >= index.capacity() {
+            let new_cap = ((index.size() + count) as f64 * 1.5) as usize;
+            let _ = index.reserve(new_cap);
         }
 
-        // 批量upsert
-        for (i, tag) in tags.iter().enumerate() {
-            let label = mapping.get_or_create_label(tag);
-            let vector_start = i * vec_dim;
-            let vector = &vec_data[vector_start..vector_start + vec_dim];
-
-            // remove + add = upsert（忽略remove错误）
-            let _ = index.remove(label as u64);
-            
-            index
-                .add(label as u64, vector)
-                .map_err(|e| Error::from_reason(format!(
-                    "Failed to add vector for tag '{}' (label {}): {:?}",
-                    tag, label, e
-                )))?;
+        for (i, id) in ids.iter().enumerate() {
+            let start = i * dim;
+            let v = &vec_slice[start..start+dim];
+            // remove + add = update (usearch 行为)
+            // let _ = index.remove(*id as u64); 
+            index.add(*id as u64, v)
+                .map_err(|e| Error::from_reason(format!("Batch add failed idx {}: {:?}", i, e)))?;
         }
 
         Ok(())
     }
 
-    /// 快速搜索
+    /// 搜索
     #[napi]
     pub fn search(&self, query: Buffer, k: u32) -> Result<Vec<SearchResult>> {
-        let mapping = self.mapping.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
         let index = self.index.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
 
-        // 将Buffer转换为f32数组
-        let query_data: &[f32] = unsafe {
+        let query_slice: &[f32] = unsafe {
             std::slice::from_raw_parts(
                 query.as_ptr() as *const f32,
                 query.len() / std::mem::size_of::<f32>(),
             )
         };
 
+        // 🔥🔥🔥【新增】维度安全检查 🔥🔥🔥
+        if query_slice.len() != self.dimensions as usize {
+            return Err(Error::from_reason(format!(
+                "Search dimension mismatch: expected {}, got {}. (Check your JS Buffer slicing!)",
+                self.dimensions,
+                query_slice.len()
+            )));
+        }
+
+        // 执行搜索
         let matches = index
-            .search(query_data, k as usize)
+            .search(query_slice, k as usize)
             .map_err(|e| Error::from_reason(format!("Search failed: {:?}", e)))?;
 
-        let mut results = Vec::new();
-        for m in matches.keys.iter().zip(matches.distances.iter()) {
-            let label = *m.0 as u32;
-            let distance = *m.1;
-
-            if let Some(tag) = mapping.get_tag(label) {
-                results.push(SearchResult {
-                    tag: tag.clone(),
-                    score: (1.0 - distance as f64),
-                });
-            }
+        let mut results = Vec::with_capacity(matches.keys.len());
+        
+        for (key, &dist) in matches.keys.iter().zip(matches.distances.iter()) {
+            results.push(SearchResult {
+                id: *key as u32,
+                score: 1.0 - dist as f64, // L2sq 距离转相似度分数 (近似)
+            });
         }
 
         Ok(results)
     }
 
-    /// 批量获取向量
+    /// 删除 (按 ID)
     #[napi]
-    pub fn get_vectors(&self, tags: Vec<String>) -> Result<Buffer> {
-        let mapping = self.mapping.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
-        let index = self.index.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
-
-        let dim = self.dimensions as usize;
-        let mut all_vectors: Vec<f32> = Vec::with_capacity(tags.len() * dim);
-        let zero_vector = vec![0.0; dim];
-        let mut vector_buffer = vec![0.0; dim];
-
-        for tag in tags {
-            if let Some(label) = mapping.tag_to_label.get(&tag) {
-                if index.get(*label as u64, &mut vector_buffer).is_ok() {
-                    all_vectors.extend_from_slice(&vector_buffer);
-                } else {
-                    all_vectors.extend_from_slice(&zero_vector);
-                }
-            } else {
-                all_vectors.extend_from_slice(&zero_vector);
-            }
-        }
-
-        let byte_slice = unsafe {
-            std::slice::from_raw_parts(
-                all_vectors.as_ptr() as *const u8,
-                all_vectors.len() * std::mem::size_of::<f32>(),
-            )
-        };
-
-        Ok(byte_slice.into())
-    }
-
-    /// 删除tags
-    #[napi]
-    pub fn remove(&self, tags: Vec<String>) -> Result<()> {
-        let mut mapping = self.mapping.write()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire write lock: {}", e)))?;
+    pub fn remove(&self, id: u32) -> Result<()> {
         let index = self.index.write()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire write lock: {}", e)))?;
-
-        for tag in tags {
-            if let Some(label) = mapping.remove(&tag) {
-                index
-                    .remove(label as u64)
-                    .map_err(|e| Error::from_reason(format!("Failed to remove: {:?}", e)))?;
-            }
-        }
-
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
+        
+        index.remove(id as u64)
+             .map_err(|e| Error::from_reason(format!("Remove failed: {:?}", e)))?;
+             
         Ok(())
     }
 
-    /// 获取统计信息
+    /// 获取当前索引状态
     #[napi]
     pub fn stats(&self) -> Result<VexusStats> {
         let index = self.index.read()
-            .map_err(|e| Error::from_reason(format!("Failed to acquire read lock: {}", e)))?;
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
 
         Ok(VexusStats {
             total_vectors: index.size() as u32,
@@ -364,5 +248,119 @@ impl VexusIndex {
             capacity: index.capacity() as u32,
             memory_usage: index.memory_usage() as u32,
         })
+    }
+
+    /// 从 SQLite 数据库恢复索引 (异步版本，不阻塞主线程)
+    #[napi]
+    pub fn recover_from_sqlite(
+        &self,
+        db_path: String,
+        table_type: String,
+        filter_diary_name: Option<String>,
+    ) -> AsyncTask<RecoverTask> {
+        AsyncTask::new(RecoverTask {
+            index: self.index.clone(),
+            db_path,
+            table_type,
+            filter_diary_name,
+            dimensions: self.dimensions,
+        })
+    }
+}
+
+pub struct RecoverTask {
+    index: Arc<RwLock<Index>>,
+    db_path: String,
+    table_type: String,
+    filter_diary_name: Option<String>,
+    dimensions: u32,
+}
+
+impl Task for RecoverTask {
+    type Output = u32;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let conn = Connection::open(&self.db_path)
+            .map_err(|e| Error::from_reason(format!("Failed to open DB: {}", e)))?;
+
+        let sql: String;
+        
+        if self.table_type == "tags" {
+            sql = "SELECT id, vector FROM tags WHERE vector IS NOT NULL".to_string();
+        } else if self.table_type == "chunks" && self.filter_diary_name.is_some() {
+            sql = "SELECT c.id, c.vector FROM chunks c JOIN files f ON c.file_id = f.id WHERE f.diary_name = ?1 AND c.vector IS NOT NULL".to_string();
+        } else {
+            return Ok(0);
+        }
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::from_reason(format!("Failed to prepare statement: {}", e)))?;
+
+        // 参数在下面的 query_map 调用中直接处理，这里不再需要准备 params 变量
+        
+        // 为了避免复杂的生命周期问题，我们简单地分别处理
+        let mut count = 0;
+        let mut skipped_dim_mismatch = 0;
+        let expected_byte_len = self.dimensions as usize * std::mem::size_of::<f32>();
+        
+        // 获取写锁
+        let index = self.index.write()
+            .map_err(|e| Error::from_reason(format!("Lock failed: {}", e)))?;
+
+        // 定义处理单行的闭包
+        let mut process_row = |id: i64, vector_bytes: Vec<u8>| {
+             if vector_bytes.len() == expected_byte_len {
+                let vec_slice: &[f32] = unsafe {
+                    std::slice::from_raw_parts(
+                        vector_bytes.as_ptr() as *const f32,
+                        self.dimensions as usize,
+                    )
+                };
+                
+                if index.size() + 1 >= index.capacity() {
+                    let new_cap = (index.capacity() as f64 * 1.5) as usize;
+                    let _ = index.reserve(new_cap);
+                }
+
+                if index.add(id as u64, vec_slice).is_ok() {
+                    count += 1;
+                }
+            } else {
+                skipped_dim_mismatch += 1;
+            }
+        };
+
+        if let Some(name) = &self.filter_diary_name {
+            let rows = stmt.query_map([name], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                .map_err(|e| Error::from_reason(format!("Query failed: {}", e)))?;
+            
+            for row_result in rows {
+                if let Ok((id, vector_bytes)) = row_result {
+                    process_row(id, vector_bytes);
+                }
+            }
+        } else {
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                .map_err(|e| Error::from_reason(format!("Query failed: {}", e)))?;
+            
+            for row_result in rows {
+                if let Ok((id, vector_bytes)) = row_result {
+                    process_row(id, vector_bytes);
+                }
+            }
+        }
+        
+        if skipped_dim_mismatch > 0 {
+            // 这里使用 println!，它会输出到 Node.js 的 stdout
+            println!("[Vexus-Lite] ⚠️ Skipped {} vectors due to dimension mismatch (Expected {} bytes, got various)", skipped_dim_mismatch, expected_byte_len);
+        }
+
+        Ok(count)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
     }
 }

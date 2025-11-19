@@ -24,6 +24,9 @@ usearch = "2.8"
 # 哈希Map优化
 hashbrown = "0.14"
 
+# SQLite 数据库驱动
+rusqlite = { version = "0.29", features = ["bundled"] }
+
 [build-dependencies]
 napi-build = "2.1"
 

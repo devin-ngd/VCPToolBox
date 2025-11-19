@@ -26,7 +26,7 @@ const crypto = require('crypto');
 const agentManager = require('./modules/agentManager.js'); // 新增：Agent管理器
 const tvsManager = require('./modules/tvsManager.js'); // 新增：TVS管理器
 const messageProcessor = require('./modules/messageProcessor.js');
-const { VectorDBManager } = require('./VectorDBManager.js'); // 新增：引入向量数据库管理器
+const knowledgeBaseManager = require('./KnowledgeBaseManager.js'); // 新增：引入统一知识库管理器
 const pluginManager = require('./Plugin.js');
 const taskScheduler = require('./routes/taskScheduler.js');
 const webSocketServer = require('./WebSocketServer.js'); // 新增 WebSocketServer 引入
@@ -153,7 +153,6 @@ for (const key in process.env) {
 if (superDetectors.length > 0) console.log(`共加载了 ${superDetectors.length} 条全局上下文转换规则。`);
 else console.log('未加载任何全局上下文转换规则。');
 
-const vectorDBManager = new VectorDBManager(); // 新增：创建 VectorDBManager 实例
 
 const app = express();
 app.use(cors({ origin: '*' })); // 启用 CORS，允许所有来源的跨域请求，方便本地文件调试
@@ -852,7 +851,7 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     dailyNoteRootPath,
     pluginManager,
     logger.getServerLogPath, // Pass the getter function
-    vectorDBManager // Pass the vectorDBManager instance
+    knowledgeBaseManager // Pass the knowledgeBaseManager instance
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -941,11 +940,11 @@ app.post('/internal/vcplog-broadcast', async (req, res) => {
 
 async function initialize() {
     console.log('开始初始化向量数据库...');
-    await vectorDBManager.initialize(); // 在加载插件之前启动，确保服务就绪
+    await knowledgeBaseManager.initialize(); // 在加载插件之前启动，确保服务就绪
     console.log('向量数据库初始化完成。');
 
     pluginManager.setProjectBasePath(__dirname);
-    pluginManager.setVectorDBManager(vectorDBManager); // 修复：注入 vectorDBManager，避免重复创建
+    pluginManager.setVectorDBManager(knowledgeBaseManager); // 注入 knowledgeBaseManager
 
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
@@ -968,7 +967,7 @@ async function initialize() {
     // 在所有服务都初始化完毕后，再执行依赖注入，确保 VCPLog 等服务已准备就绪。
     try {
         const dependencies = {
-            vectorDBManager,
+            knowledgeBaseManager,
             vcpLogFunctions: pluginManager.getVCPLogFunctions()
         };
         if (DEBUG_MODE) console.log('[Server] Injecting dependencies into plugins...');
