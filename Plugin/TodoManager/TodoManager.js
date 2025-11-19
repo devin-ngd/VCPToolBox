@@ -39,7 +39,7 @@ async function createScheduledReminder(todo) {
 
         const taskFile = path.join(TIMED_CONTACTS_DIR, `${taskId}.json`);
         await fs.writeFile(taskFile, JSON.stringify(taskData, null, 2), 'utf-8');
-        console.log(`[TodoManager] 已创建定时提醒任务: ${taskId}`);
+        console.error(`[TodoManager] 已创建定时提醒任务: ${taskId}`);
     } catch (error) {
         console.error(`[TodoManager] 创建定时提醒任务失败:`, error);
         // 不抛出错误，因为这不应该影响待办的创建
@@ -58,7 +58,7 @@ async function deleteScheduledReminder(todoId) {
         try {
             await fs.access(taskFile);
             await fs.unlink(taskFile);
-            console.log(`[TodoManager] 已删除定时提醒任务: ${taskId}`);
+            console.error(`[TodoManager] 已删除定时提醒任务: ${taskId}`);
         } catch (err) {
             // 文件不存在，忽略
             if (err.code !== 'ENOENT') {
@@ -236,7 +236,7 @@ async function createTodo(args) {
         // 只有当提醒时间在未来时才设置
         if (defaultReminderDate > new Date()) {
             reminderTime = defaultReminderDate.toISOString();
-            console.log(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${reminderTime}`);
+            console.error(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${reminderTime}`);
         }
     }
 
@@ -511,7 +511,7 @@ async function updateTodo(args) {
                 if (defaultReminderDate > new Date()) {
                     todo.reminderTime = defaultReminderDate.toISOString();
                     reminderTimeChanged = true;
-                    console.log(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${todo.reminderTime}`);
+                    console.error(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${todo.reminderTime}`);
                 }
             }
         }
