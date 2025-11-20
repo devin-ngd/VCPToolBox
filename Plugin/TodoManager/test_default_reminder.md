@@ -96,12 +96,12 @@ when:「始」昨天下午3点「末」
 
 2. **检查定时任务文件**
    ```cmd
-   dir d:\workspace\agents\VCPToolBox\VCPTimedContacts\todo_remind_*.json
+   dir d:\workspace\VCP\VCPToolBox\VCPTimedContacts\todo_remind_*.json
    ```
 
 3. **查看任务文件内容**
    ```cmd
-   type d:\workspace\agents\VCPToolBox\VCPTimedContacts\todo_remind_{id}.json
+   type d:\workspace\VCP\VCPToolBox\VCPTimedContacts\todo_remind_{id}.json
    ```
    应包含：
    - `scheduledLocalTime`: 提醒时间
