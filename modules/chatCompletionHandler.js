@@ -997,9 +997,11 @@ class ChatCompletionHandler {
               body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
               signal: abortController.signal, // 传递中止信号
             },
-            apiRetries,
-            apiRetryDelay,
-            DEBUG_MODE,
+            {
+              retries: apiRetries,
+              delay: apiRetryDelay,
+              debugMode: DEBUG_MODE
+            }
           );
 
           if (!nextAiAPIResponse.ok) {
@@ -1495,9 +1497,11 @@ class ChatCompletionHandler {
                 body: JSON.stringify({ ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false }),
                 signal: abortController.signal, // 传递中止信号
               },
-              apiRetries,
-              apiRetryDelay,
-              DEBUG_MODE,
+              {
+                retries: apiRetries,
+                delay: apiRetryDelay,
+                debugMode: DEBUG_MODE
+              }
             );
 
             if (!recursionAiResponse.ok) {
@@ -1623,46 +1627,53 @@ class ChatCompletionHandler {
           // 这里等待一小段时间，让中断路由有机会处理
           console.log(`[Abort] Headers not sent yet. Waiting for interrupt handler...`);
           setTimeout(() => {
-            // 再次检查响应状态
-            if (res.writableEnded || res.destroyed) {
-              console.log(`[Abort] Response was closed by interrupt handler during wait.`);
-              return;
-            }
-            
-            if (!res.headersSent) {
-              // 中断路由没有处理，我们来处理
-              console.log(`[Abort] Interrupt handler didn't process. Handling abort here.`);
-              if (isOriginalRequestStreaming) {
-                // 流式请求
-                res.status(200);
-                res.setHeader('Content-Type', 'text/event-stream');
-                res.setHeader('Cache-Control', 'no-cache');
-                res.setHeader('Connection', 'keep-alive');
-                
-                const abortChunk = {
-                  id: `chatcmpl-abort-${Date.now()}`,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: originalBody.model || 'unknown',
-                  choices: [{
-                    index: 0,
-                    delta: { content: '请求已被用户中止' },
-                    finish_reason: 'stop'
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(abortChunk)}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
-              } else {
-                // 非流式请求
-                res.status(200).json({
-                  choices: [{
-                    index: 0,
-                    message: { role: 'assistant', content: '请求已被用户中止' },
-                    finish_reason: 'stop',
-                  }],
-                });
+            try {
+              // 再次检查响应状态
+              if (res.writableEnded || res.destroyed) {
+                console.log(`[Abort] Response was closed by interrupt handler during wait.`);
+                return;
               }
+              
+              if (!res.headersSent) {
+                // 中断路由没有处理，我们来处理
+                console.log(`[Abort] Interrupt handler didn't process. Handling abort here.`);
+                if (isOriginalRequestStreaming) {
+                  // 流式请求
+                  res.status(200);
+                  res.setHeader('Content-Type', 'text/event-stream');
+                  res.setHeader('Cache-Control', 'no-cache');
+                  res.setHeader('Connection', 'keep-alive');
+                  
+                  const abortChunk = {
+                    id: `chatcmpl-abort-${Date.now()}`,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: originalBody.model || 'unknown',
+                    choices: [{
+                      index: 0,
+                      delta: { content: '请求已被用户中止' },
+                      finish_reason: 'stop'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(abortChunk)}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                  res.end();
+                } else {
+                  // 非流式请求
+                  res.status(200).json({
+                    choices: [{
+                      index: 0,
+                      message: { role: 'assistant', content: '请求已被用户中止' },
+                      finish_reason: 'stop',
+                    }],
+                  });
+                }
+              }
+            } catch (e) {
+                console.error('[Abort] Error within abort handler timeout:', e.message);
+                if (!res.writableEnded) {
+                    try { res.end(); } catch (endErr) { /* ignore */ }
+                }
             }
           }, 50); // 等待50ms让中断路由处理
         }

@@ -648,13 +648,31 @@ const chatCompletionHandler = new ChatCompletionHandler({
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
-app.post('/v1/chat/completions', (req, res) => {
-    chatCompletionHandler.handle(req, res, false);
+app.post('/v1/chat/completions', async (req, res) => {
+    try {
+        await chatCompletionHandler.handle(req, res, false);
+    } catch (e) {
+        console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "A fatal internal error occurred." });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
 });
 
 // Route to force VCP info to be shown, regardless of the .env config.
-app.post('/v1/chatvcp/completions', (req, res) => {
-    chatCompletionHandler.handle(req, res, true);
+app.post('/v1/chatvcp/completions', async (req, res) => {
+    try {
+        await chatCompletionHandler.handle(req, res, true);
+    } catch (e) {
+        console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "A fatal internal error occurred." });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
 });
 
 // 新增：人类直接调用工具的端点

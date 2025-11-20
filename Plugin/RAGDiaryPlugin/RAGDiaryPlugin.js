@@ -254,6 +254,8 @@ class RAGDiaryPlugin {
         this.cacheTTL = 3600000; // 缓存有效期 1小时（毫秒）
         this.lastConfigHash = null; // 用于检测配置变更
         
+        this.queryCacheEnabled = true; // ✅ 新增：查询缓存开关
+        
         // ✅ 新增：向量缓存（文本 -> 向量的映射）
         this.embeddingCache = new Map();
         this.embeddingCacheMaxSize = 500; // 可配置
@@ -272,7 +274,13 @@ class RAGDiaryPlugin {
         // ✅ 从环境变量读取缓存配置
         this.maxCacheSize = parseInt(process.env.RAG_CACHE_MAX_SIZE) || 100;
         this.cacheTTL = parseInt(process.env.RAG_CACHE_TTL_MS) || 3600000;
-        console.log(`[RAGDiaryPlugin] 查询缓存已启用 (最大: ${this.maxCacheSize}条, TTL: ${this.cacheTTL}ms)`);
+        this.queryCacheEnabled = (process.env.RAG_QUERY_CACHE_ENABLED || 'true').toLowerCase() === 'true';
+
+        if (this.queryCacheEnabled) {
+            console.log(`[RAGDiaryPlugin] 查询缓存已启用 (最大: ${this.maxCacheSize}条, TTL: ${this.cacheTTL}ms)`);
+        } else {
+            console.log(`[RAGDiaryPlugin] 查询缓存已禁用`);
+        }
 
         // ✅ 从环境变量读取向量缓存配置
         this.embeddingCacheMaxSize = parseInt(process.env.EMBEDDING_CACHE_MAX_SIZE) || 500;
@@ -1003,7 +1011,7 @@ class RAGDiaryPlugin {
             processingPromises.push((async () => {
                 const diaryConfig = this.ragConfig[dbName] || {};
                 const localThreshold = diaryConfig.threshold || GLOBAL_SIMILARITY_THRESHOLD;
-                const dbNameVector = this.vectorDBManager.getDiaryNameVector(dbName); // <--- 使用缓存
+                const dbNameVector = await this.vectorDBManager.getDiaryNameVector(dbName); // <--- 使用缓存
                 if (!dbNameVector) {
                     console.warn(`[RAGDiaryPlugin] Could not find cached vector for diary name: "${dbName}". Skipping.`);
                     const emptyResult = '';
@@ -1067,7 +1075,7 @@ class RAGDiaryPlugin {
                 try {
                     const diaryConfig = this.ragConfig[dbName] || {};
                     const localThreshold = diaryConfig.threshold || GLOBAL_SIMILARITY_THRESHOLD;
-                    const dbNameVector = this.vectorDBManager.getDiaryNameVector(dbName);
+                    const dbNameVector = await this.vectorDBManager.getDiaryNameVector(dbName);
                     if (!dbNameVector) {
                         console.warn(`[RAGDiaryPlugin] Could not find cached vector for diary name: "${dbName}". Skipping.`);
                         const emptyResult = '';
@@ -1974,6 +1982,10 @@ class RAGDiaryPlugin {
      * ✅ 从缓存获取结果
      */
     _getCachedResult(cacheKey) {
+        if (!this.queryCacheEnabled) {
+            this.cacheMisses++; // 仍然记录 miss，以便统计
+            return null;
+        }
         const cached = this.queryResultCache.get(cacheKey);
         
         if (!cached) {
@@ -2002,6 +2014,7 @@ class RAGDiaryPlugin {
      * ✅ 将结果存入缓存（带LRU淘汰策略）
      */
     _setCachedResult(cacheKey, result) {
+        if (!this.queryCacheEnabled) return;
         // LRU策略：超过容量时删除最早的条目
         if (this.queryResultCache.size >= this.maxCacheSize) {
             const firstKey = this.queryResultCache.keys().next().value;

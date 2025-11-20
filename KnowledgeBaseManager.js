@@ -162,17 +162,18 @@ class KnowledgeBaseManager {
         const idxPath = path.join(this.config.storePath, `index_${fileName}.usearch`);
         let idx;
         try {
-            // 检查维度一致性 (简单做法：如果文件存在直接加载，否则新建)
             if (fsSync.existsSync(idxPath)) {
-                // 注意：Vexus load 需要维度匹配，否则会报错
                 idx = VexusIndex.load(idxPath, null, this.config.dimension, capacity);
             } else {
+                // 💡 核心修复：如果索引文件不存在，说明是首次创建。
+                // 此时不应从数据库恢复，因为调用者（_flushBatch）正准备写入初始数据。
+                // 从数据库恢复的逻辑只适用于启动时加载或文件损坏后的重建。
+                console.log(`[KnowledgeBase] Index file not found for ${fileName}, creating a new empty one.`);
                 idx = new VexusIndex(this.config.dimension, capacity);
-                await this._recoverIndexFromDB(idx, tableType, filterDiaryName);
             }
         } catch (e) {
             console.error(`[KnowledgeBase] Index load error (${fileName}): ${e.message}`);
-            console.warn(`[KnowledgeBase] Rebuilding index ${fileName} from DB...`);
+            console.warn(`[KnowledgeBase] Rebuilding index ${fileName} from DB as a fallback...`);
             idx = new VexusIndex(this.config.dimension, capacity);
             await this._recoverIndexFromDB(idx, tableType, filterDiaryName);
         }
@@ -547,7 +548,7 @@ class KnowledgeBaseManager {
     // =========================================================================
 
     // 🛠️ 修复 3: 同步回退 + 缓存预热
-    getDiaryNameVector(diaryName) {
+    async getDiaryNameVector(diaryName) {
         if (!diaryName) return null;
         
         // 1. 查内存缓存
@@ -555,7 +556,7 @@ class KnowledgeBaseManager {
             return this.diaryNameVectorCache.get(diaryName);
         }
         
-        // 2. 查数据库 (同步) - 解决 "Lazy Loading" 导致的第一次请求失败
+        // 2. 查数据库 (同步)
         try {
             const row = this.db.prepare("SELECT vector FROM kv_store WHERE key = ?").get(`diary_name:${diaryName}`);
             if (row && row.vector) {
@@ -567,10 +568,9 @@ class KnowledgeBaseManager {
             console.warn(`[KnowledgeBase] DB lookup failed for diary name: ${diaryName}`);
         }
 
-        // 3. 还是没有，触发异步获取 (由于 RAG 插件是同步期待，这里只能返回 null 并触发后台更新)
-        console.warn(`[KnowledgeBase] Cache MISS for diary name vector: "${diaryName}". Triggering async fetch.`);
-        this._fetchAndCacheDiaryNameVector(diaryName);
-        return null;
+        // 3. 缓存未命中，同步等待向量化
+        console.warn(`[KnowledgeBase] Cache MISS for diary name vector: "${diaryName}". Fetching now...`);
+        return await this._fetchAndCacheDiaryNameVector(diaryName);
     }
     
     // 强制同步预热缓存
@@ -598,8 +598,12 @@ class KnowledgeBaseManager {
                 this.diaryNameVectorCache.set(name, vec);
                 const vecBuf = Buffer.from(new Float32Array(vec).buffer);
                 this.db.prepare("INSERT OR REPLACE INTO kv_store (key, vector) VALUES (?, ?)").run(`diary_name:${name}`, vecBuf);
+                return vec; // 返回向量
             }
-        } catch (e) { console.error(`Failed to vectorize diary name ${name}`); }
+        } catch (e) {
+            console.error(`Failed to vectorize diary name ${name}`);
+        }
+        return null; // 失败时返回 null
     }
     
     // 兼容性 API: getVectorByText
@@ -735,18 +739,19 @@ class KnowledgeBaseManager {
             }
 
             // Tag 处理
-            const newTags = [];
-            const tagCache = new Map(); 
+            const newTagsSet = new Set();
+            const tagCache = new Map();
             const checkTag = this.db.prepare('SELECT id, vector FROM tags WHERE name = ?');
             for (const t of uniqueTags) {
                 const row = checkTag.get(t);
                 if (row && row.vector) tagCache.set(t, { id: row.id, vector: row.vector });
                 else {
                     const cleanedTag = this._prepareTextForEmbedding(t);
-                    if (cleanedTag !== '[EMPTY_CONTENT]') newTags.push(cleanedTag);
+                    if (cleanedTag !== '[EMPTY_CONTENT]') newTagsSet.add(cleanedTag);
                 }
             }
 
+            const newTags = Array.from(newTagsSet);
             // 3. Embedding API Calls
             const embeddingConfig = { apiKey: this.config.apiKey, apiUrl: this.config.apiUrl, model: this.config.model };
             
@@ -767,7 +772,8 @@ class KnowledgeBaseManager {
 
             // 4. 写入 DB 和 索引
             const transaction = this.db.transaction(() => {
-                const updates = new Map(); 
+                const updates = new Map();
+                const deletions = new Map(); // 💡 新增：记录待删除的 chunk ID
                 const tagUpdates = [];
 
                 const insertTag = this.db.prepare('INSERT OR IGNORE INTO tags (name, vector) VALUES (?, ?)');
@@ -786,6 +792,7 @@ class KnowledgeBaseManager {
                 const insertFile = this.db.prepare('INSERT INTO files (path, diary_name, checksum, mtime, size, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
                 const updateFile = this.db.prepare('UPDATE files SET checksum = ?, mtime = ?, size = ?, updated_at = ? WHERE id = ?');
                 const getFile = this.db.prepare('SELECT id FROM files WHERE path = ?');
+                const getOldChunkIds = this.db.prepare('SELECT id FROM chunks WHERE file_id = ?'); // 💡 新增
                 const delChunks = this.db.prepare('DELETE FROM chunks WHERE file_id = ?');
                 const delRels = this.db.prepare('DELETE FROM file_tags WHERE file_id = ?');
                 const addChunk = this.db.prepare('INSERT INTO chunks (file_id, chunk_index, content, vector) VALUES (?, ?, ?, ?)');
@@ -805,6 +812,14 @@ class KnowledgeBaseManager {
 
                         if (fRow) {
                             fileId = fRow.id;
+                            
+                            // 💡 核心修复：在删除数据库记录前，先收集旧 chunk ID 用于后续的索引清理
+                            const oldChunkIds = getOldChunkIds.all(fileId).map(c => c.id);
+                            if (oldChunkIds.length > 0) {
+                                if (!deletions.has(dName)) deletions.set(dName, []);
+                                deletions.get(dName).push(...oldChunkIds);
+                            }
+
                             updateFile.run(doc.checksum, doc.mtime, doc.size, now, fileId);
                             delChunks.run(fileId);
                             delRels.run(fileId);
@@ -829,17 +844,64 @@ class KnowledgeBaseManager {
                     });
                 }
 
-                return { updates, tagUpdates };
+                return { updates, tagUpdates, deletions };
             });
 
-            const { updates, tagUpdates } = transaction();
+            const { updates, tagUpdates, deletions } = transaction();
 
-            tagUpdates.forEach(u => this.tagIndex.add(u.id, u.vec));
+            // 💡 核心修复：在添加新向量之前，先从 Vexus 索引中移除所有旧的向量
+            if (deletions && deletions.size > 0) {
+                for (const [dName, chunkIds] of deletions) {
+                    const idx = await this._getOrLoadDiaryIndex(dName);
+                    if (idx && idx.remove) {
+                        chunkIds.forEach(id => idx.remove(id));
+                    }
+                }
+            }
+
+            // 🛠️ 修复：针对 Tag Index 的安全写入
+            tagUpdates.forEach(u => {
+                try {
+                    this.tagIndex.add(u.id, u.vec);
+                } catch (e) {
+                    if (e.message && e.message.includes('Duplicate')) {
+                        try {
+                            if (this.tagIndex.remove) this.tagIndex.remove(u.id);
+                            this.tagIndex.add(u.id, u.vec);
+                        } catch (retryErr) {
+                            console.error(`[KnowledgeBase] ❌ Failed to upsert tag ${u.id}:`, retryErr.message);
+                        }
+                    }
+                }
+            });
             this._scheduleIndexSave('global_tags');
 
+            // 🛠️ 修复：针对 Diary Index 的安全写入
             for (const [dName, chunks] of updates) {
                 const idx = await this._getOrLoadDiaryIndex(dName);
-                chunks.forEach(u => idx.add(u.id, u.vec));
+                
+                chunks.forEach(u => {
+                    try {
+                        // 尝试直接添加
+                        idx.add(u.id, u.vec);
+                    } catch (e) {
+                        // 捕获 "Duplicate keys" 错误
+                        if (e.message && e.message.includes('Duplicate')) {
+                            // console.warn(`[KnowledgeBase] ⚠️ ID Collision detected for ${u.id} in ${dName}. Performing upsert.`);
+                            try {
+                                // 策略：先移除冲突的 ID，再重新添加 (Upsert)
+                                if (idx.remove) idx.remove(u.id);
+                                idx.add(u.id, u.vec);
+                            } catch (retryErr) {
+                                console.error(`[KnowledgeBase] ❌ Failed to upsert vector ${u.id} in ${dName}:`, retryErr.message);
+                            }
+                        } else {
+                            // 如果是其他错误（如维度不对），则抛出
+                            console.error(`[KnowledgeBase] ❌ Vector add error detected:`, e);
+                        }
+                    }
+                });
+                
                 this._scheduleIndexSave(dName);
             }
 
