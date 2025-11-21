@@ -177,3 +177,4 @@ ip_blacklist.json
 Plugin/IMAPIndex/mail_store/uid.index
 VCPTimedContacts/todo_remind_todo*.json
 Plugin/UserAuth/code.bin
+*magi-session-*.json

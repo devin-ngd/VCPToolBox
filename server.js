@@ -9,6 +9,20 @@ const utc = require('dayjs/plugin/utc');
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
+// 配置代理绕过规则 - 在加载其他模块前设置
+// 本地和内网地址直连，其他走代理
+const noProxy = process.env.NO_PROXY || '';
+const bypassList = ['localhost', '127.0.0.1', '172.21.70.*', '192.168.*', '10.*'];
+if (!noProxy) {
+    process.env.NO_PROXY = bypassList.join(',');
+} else {
+    // 合并现有的 NO_PROXY 配置
+    const existingList = noProxy.split(',').map(s => s.trim()).filter(Boolean);
+    const mergedList = [...new Set([...existingList, ...bypassList])];
+    process.env.NO_PROXY = mergedList.join(',');
+}
+console.log('[Proxy] NO_PROXY configured:', process.env.NO_PROXY);
+
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const fs = require('fs').promises; // fs.promises for async operations
 const path = require('path');
