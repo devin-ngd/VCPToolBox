@@ -25,7 +25,7 @@ if (!apiKey) {
 }
 
 // 定义Agent列表
-const agents = ["小娜", "小克", "小闫", "小吉", "小雨", "小绝", "Nova", "小芸", "小冰"];
+const agents = ["雪琪", "小玉", "启明", "Nova"];
 
 // 随机选择一个Agent
 const randomAgent = agents[Math.floor(Math.random() * agents.length)];
