@@ -24,8 +24,8 @@ if (!apiKey) {
     process.exit(1); // 错误退出
 }
 
-// 定义Agent列表
-const agents = ["雪琪", "小玉", "启明", "Nova"];
+// 定义Agent列表 (使用 AgentAssistant 中的中文名称)
+const agents = ["Nova", "雪琪", "小玉", "启明"];
 
 // 随机选择一个Agent
 const randomAgent = agents[Math.floor(Math.random() * agents.length)];
