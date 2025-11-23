@@ -41,15 +41,19 @@ class SmartTimeParser {
         let minute = 0;
 
         // 解析时间部分（如"下午3点"、"15:30"）
+        // 注意：需要先匹配带上下午/晚上等前缀的模式，再匹配纯数字模式
         const timePatterns = [
+            { regex: /下午(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = parseInt(m[2]); hasTime = true; } },
+            { regex: /下午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = 0; hasTime = true; } },
+            { regex: /上午(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
+            { regex: /上午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
+            { regex: /晚上(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = parseInt(m[2]); hasTime = true; } },
+            { regex: /晚上(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = 0; hasTime = true; } },
+            { regex: /中午/, handler: () => { hour = 12; minute = 0; hasTime = true; } },
+            { regex: /早上/, handler: () => { hour = 8; minute = 0; hasTime = true; } },
             { regex: /(\d{1,2}):(\d{2})/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
-            { regex: /下午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); hasTime = true; } },
-            { regex: /上午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); hasTime = true; } },
-            { regex: /晚上(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); hasTime = true; } },
-            { regex: /中午/, handler: () => { hour = 12; minute = 0; hasTime = true; } },
-            { regex: /早上/, handler: () => { hour = 8; minute = 0; hasTime = true; } },
         ];
 
         for (const pattern of timePatterns) {
@@ -73,18 +77,18 @@ class SmartTimeParser {
             targetDate.setDate(targetDate.getDate() - 1);
         } else {
             // 匹配"N天后"、"N小时后"等
-            const daysMatch = text.match(/(\d+)\s*天[后之]?后?/);
+            const daysMatch = text.match(/(\d+)\s*天[\u540e\u4e4b]?/);
             if (daysMatch) {
                 targetDate.setDate(targetDate.getDate() + parseInt(daysMatch[1]));
             }
 
-            const hoursMatch = text.match(/(\d+)\s*[个]?小时[后之]?后?/);
+            const hoursMatch = text.match(/(\d+)\s*[个]?小时[\u540e\u4e4b]?/);
             if (hoursMatch) {
                 targetDate.setHours(targetDate.getHours() + parseInt(hoursMatch[1]));
                 return targetDate.toISOString();
             }
 
-            const minutesMatch = text.match(/(\d+)\s*分钟[后之]?后?/);
+            const minutesMatch = text.match(/(\d+)\s*分钟[\u540e\u4e4b]?/);
             if (minutesMatch) {
                 targetDate.setMinutes(targetDate.getMinutes() + parseInt(minutesMatch[1]));
                 return targetDate.toISOString();
@@ -130,6 +134,12 @@ class SmartTimeParser {
         } else {
             // 如果没有指定时间，默认设为9:00
             targetDate.setHours(9, 0, 0, 0);
+        }
+
+        // 验证日期有效性
+        if (isNaN(targetDate.getTime())) {
+            console.error(`[SmartTimeParser] 无效的日期解析结果: ${naturalTime}`);
+            return null;
         }
 
         return targetDate.toISOString();
@@ -180,9 +190,19 @@ class SmartTimeParser {
         if (!remindOffset) return null;
 
         const whenDate = new Date(whenTime);
-        const offset = this.parseOffset(remindOffset);
+        if (isNaN(whenDate.getTime())) {
+            console.error(`[SmartTimeParser] 无效的whenTime: ${whenTime}`);
+            return null;
+        }
 
+        const offset = this.parseOffset(remindOffset);
         const reminderDate = new Date(whenDate.getTime() + offset);
+
+        if (isNaN(reminderDate.getTime())) {
+            console.error(`[SmartTimeParser] 计算提醒时间失败: whenTime=${whenTime}, offset=${offset}`);
+            return null;
+        }
+
         return reminderDate.toISOString();
     }
 }

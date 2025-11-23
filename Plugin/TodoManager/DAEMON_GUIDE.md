@@ -101,7 +101,7 @@ VCP_SERVER_HOST=localhost
 VCP_SERVER_PORT=8855
 
 # 每日待办汇总推送时间（小时，24小时制）
-DAILY_SUMMARY_HOUR=8
+DAILY_SUMMARY_HOUR=9
 ```
 
 ## 单次提醒机制（新）

@@ -144,8 +144,41 @@ function initialize(httpServer, config) {
                 } else {
                     clients.set(clientId, ws);
                     writeLog(`Client ${clientId} (Type: ${clientType}) authenticated and connected.`);
+
+                    // 如果是VCPLog客户端连接，通知ReminderDaemon
+                    if (clientType === 'VCPLog') {
+                        const http = require('http');
+                        const notifyData = JSON.stringify({
+                            message: `VCPLog client ${clientId} connected`,
+                            timestamp: new Date().toISOString()
+                        });
+
+                        const options = {
+                            hostname: 'localhost',
+                            port: 8856,
+                            path: '/vcplog-connected',
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Content-Length': Buffer.byteLength(notifyData)
+                            }
+                        };
+
+                        const req = http.request(options, (res) => {
+                            if (serverConfig.debugMode) {
+                                writeLog(`通知ReminderDaemon VCPLog连接成功: ${res.statusCode}`);
+                            }
+                        });
+
+                        req.on('error', (error) => {
+                            writeLog(`通知ReminderDaemon失败: ${error.message}`);
+                        });
+
+                        req.write(notifyData);
+                        req.end();
+                    }
                 }
-                
+
                 wssInstance.emit('connection', ws, request);
             });
         }

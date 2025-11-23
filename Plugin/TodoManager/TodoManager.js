@@ -129,6 +129,393 @@ function parseDateTime(dateStr, timeStr) {
 }
 
 /**
+ * 错误码定义
+ */
+const ERROR_CODES = {
+    // 格式相关错误 (1000-1099)
+    INVALID_JSON: 1001,
+    MISSING_VERSION: 1002,
+    UNSUPPORTED_VERSION: 1003,
+    INVALID_SCHEMA: 1004,
+
+    // 数据相关错误 (1100-1199)
+    MISSING_REQUIRED_FIELD: 1101,
+    INVALID_FIELD_TYPE: 1102,
+    INVALID_ENUM_VALUE: 1103,
+    INVALID_DATA: 1104,
+
+    // 业务逻辑错误 (1200-1299)
+    TODO_NOT_FOUND: 1201,
+    INVALID_TODO_STATUS: 1202,
+    INVALID_DEADLINE: 1203,
+
+    // 系统错误 (1300-1399)
+    PARSE_ERROR: 1301,
+    SERIALIZE_ERROR: 1302,
+    NETWORK_ERROR: 1303
+};
+
+/**
+ * 自动检测提醒格式版本
+ * @param {string|object} data - 接收到的数据
+ * @returns {object} 检测结果 {version, format, parsedData}
+ */
+function detectReminderFormat(data) {
+    // 尝试JSON.parse
+    try {
+        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+
+        // 检查是否为结构化格式
+        if (parsed && parsed.version === '2.0' && parsed.type === 'TODO_REMINDER') {
+            return {
+                version: '2.0',
+                format: 'structured',
+                parsedData: parsed
+            };
+        }
+
+        // 检查是否为v1.0对象格式
+        if (parsed && parsed.type === 'TODO_REMINDER' && !parsed.version) {
+            return {
+                version: '1.0',
+                format: 'legacy_object',
+                parsedData: parsed
+            };
+        }
+
+        // 如果不是对象，则为纯文本
+        return {
+            version: '1.0',
+            format: 'legacy_text',
+            parsedData: data
+        };
+    } catch (e) {
+        // JSON解析失败，按纯文本处理
+        return {
+            version: '1.0',
+            format: 'legacy_text',
+            parsedData: data
+        };
+    }
+}
+
+/**
+ * 安全解析提醒数据
+ * @param {string|object} rawData - 原始数据
+ * @returns {object} 解析结果
+ */
+function safeParseReminder(rawData) {
+    try {
+        // 1. 尝试JSON.parse
+        const parsed = typeof rawData === 'string'
+            ? JSON.parse(rawData)
+            : rawData;
+
+        // 2. 验证必要字段
+        if (!parsed.type || parsed.type !== 'TODO_REMINDER') {
+            throw new Error('缺少type字段或类型不正确');
+        }
+
+        // 3. 检查版本
+        if (!parsed.version) {
+            // v1.0格式，按legacy处理
+            return {
+                success: true,
+                version: '1.0',
+                data: parsed,
+                isLegacy: true
+            };
+        }
+
+        // 4. 验证v2.0格式
+        if (parsed.version !== '2.0') {
+            throw new Error(`不支持的版本: ${parsed.version}`);
+        }
+
+        return {
+            success: true,
+            version: '2.0',
+            data: parsed,
+            isLegacy: false
+        };
+
+    } catch (error) {
+        // 记录错误
+        console.error('Reminder parse error:', error);
+
+        // 尝试降级处理
+        if (typeof rawData === 'string') {
+            return {
+                success: false,
+                error: {
+                    code: ERROR_CODES.PARSE_ERROR,
+                    type: 'PARSE_ERROR',
+                    message: error.message,
+                    details: { originalData: rawData }
+                },
+                fallback: {
+                    version: '1.0',
+                    message: '降级到纯文本格式',
+                    textData: rawData
+                }
+            };
+        }
+
+        return {
+            success: false,
+            error: {
+                code: ERROR_CODES.INVALID_DATA,
+                type: 'INVALID_DATA',
+                message: '数据格式完全无效'
+            }
+        };
+    }
+}
+
+/**
+ * 生成提醒唯一标识符
+ */
+function generateReminderId(todoId, timestamp) {
+    return `reminder_${timestamp}_${todoId.split('_').pop()}`;
+}
+
+/**
+ * 计算完成进度（基于子任务或时间）
+ */
+function calculateProgress(todo) {
+    // 如果有子任务，根据子任务完成情况计算
+    if (todo.subTasks && todo.subTasks.length > 0) {
+        const completed = todo.subTasks.filter(st => st.completed).length;
+        return completed / todo.subTasks.length;
+    }
+
+    // 如果有待办时间，根据时间计算进度
+    if (todo.whenTime && todo.createdAt) {
+        const created = new Date(todo.createdAt).getTime();
+        const due = new Date(todo.whenTime).getTime();
+        const now = Date.now();
+
+        if (now >= due) {
+            return todo.status === 'completed' ? 1 : 0;
+        }
+
+        const total = due - created;
+        const elapsed = now - created;
+        return Math.min(Math.max(elapsed / total, 0), 1);
+    }
+
+    // 默认值
+    return todo.status === 'completed' ? 1 : 0;
+}
+
+/**
+ * 生成时间信息
+ */
+function generateTimeInfo(todo, reminderType = 'normal') {
+    if (!todo.whenTime) {
+        return {
+            timeRemaining: null,
+            minutesRemaining: null,
+            isUrgent: false
+        };
+    }
+
+    const now = new Date();
+    const dueDate = new Date(todo.whenTime);
+    const diffMs = dueDate - now;
+    const diffMinutes = Math.floor(diffMs / (1000 * 60));
+
+    let timeRemaining;
+    if (diffMs < 0) {
+        timeRemaining = '已逾期';
+    } else if (diffMinutes < 60) {
+        timeRemaining = `${diffMinutes}分钟后截止`;
+    } else if (diffMinutes < 24 * 60) {
+        const hours = Math.floor(diffMinutes / 60);
+        timeRemaining = `${hours}小时后截止`;
+    } else {
+        const days = Math.floor(diffMinutes / (24 * 60));
+        timeRemaining = `${days}天后截止`;
+    }
+
+    return {
+        timeRemaining: timeRemaining,
+        minutesRemaining: diffMinutes > 0 ? diffMinutes : null,
+        isUrgent: diffMinutes > 0 && diffMinutes <= 30
+    };
+}
+
+/**
+ * 生成逾期信息
+ */
+function generateOverdueInfo(todo) {
+    if (!todo.whenTime) return null;
+
+    const now = new Date();
+    const dueDate = new Date(todo.whenTime);
+    const overdueMs = now - dueDate;
+
+    if (overdueMs <= 0) return null;
+
+    const daysOverdue = Math.floor(overdueMs / (1000 * 60 * 60 * 24));
+    const hoursOverdue = Math.floor((overdueMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+
+    let severity;
+    if (daysOverdue >= 7) {
+        severity = 'severe';
+    } else if (daysOverdue >= 3) {
+        severity = 'moderate';
+    } else {
+        severity = 'mild';
+    }
+
+    return {
+        daysOverdue: daysOverdue,
+        hoursOverdue: hoursOverdue,
+        severity: severity
+    };
+}
+
+/**
+ * 生成操作按钮列表
+ */
+function generateActions(todo, reminderType) {
+    const actions = [
+        {
+            type: 'complete',
+            label: '标记完成',
+            command: `UpdateTodo status:completed todoId:${todo.id}`,
+            disabled: false
+        },
+        {
+            type: 'view',
+            label: '查看详情',
+            command: `GetTodoDetail todoId:${todo.id}`,
+            disabled: false
+        }
+    ];
+
+    if (reminderType === 'normal' && todo.whenTime) {
+        actions.push({
+            type: 'snooze',
+            label: '稍后提醒',
+            command: `SnoozeReminder todoId:${todo.id} minutes:30`,
+            disabled: false
+        });
+    }
+
+    if (reminderType === 'overdue') {
+        actions.push({
+            type: 'reschedule',
+            label: '修改截止时间',
+            command: `UpdateTodo todoId:${todo.id} when:tomorrow`,
+            disabled: false
+        });
+    }
+
+    return actions;
+}
+
+/**
+ * 生成显示配置
+ */
+function generateDisplayConfig(priority, reminderType) {
+    const priorityConfig = {
+        high: { color: '#e74c3c', icon: 'exclamation-circle' },
+        medium: { color: '#f39c12', icon: 'clock' },
+        low: { color: '#2ecc71', icon: 'check-circle' },
+        normal: { color: '#3498db', icon: 'circle' }
+    };
+
+    const config = priorityConfig[priority] || priorityConfig.normal;
+
+    let color = config.color;
+    if (reminderType === 'overdue') {
+        color = '#e74c3c';
+    } else if (reminderType === 'daily_summary') {
+        color = '#3498db';
+    }
+
+    return {
+        showNotification: true,
+        playSound: reminderType !== 'daily_summary',
+        icon: config.icon,
+        color: color
+    };
+}
+
+/**
+ * 生成结构化JSON提醒格式（v2.0）
+ */
+function generateStructuredReminder(todo, reminderType = 'normal', options = {}) {
+    const now = Date.now();
+
+    // 基础字段回退处理
+    const safeTitle = (todo.title && String(todo.title).trim()) ? todo.title : '未命名待办';
+    const safeContent = (todo.description && String(todo.description).trim())
+        ? todo.description
+        : (reminderType === 'daily_summary' ? safeTitle : safeTitle); // 汇总类也回退到标题
+
+    const createdTs = (() => {
+        if (todo.createdAt) {
+            const t = new Date(todo.createdAt).getTime();
+            return isNaN(t) ? now : t;
+        }
+        return now;
+    })();
+    const updatedTs = (() => {
+        if (todo.updatedAt) {
+            const t = new Date(todo.updatedAt).getTime();
+            return isNaN(t) ? createdTs : t;
+        }
+        return createdTs;
+    })();
+
+    const reminder = {
+        version: '2.0',
+        type: 'TODO_REMINDER',
+        reminderType: reminderType,
+        priority: todo.priority || 'normal',
+        data: {
+            id: generateReminderId(todo.id, now),
+            todoId: todo.id,
+            title: safeTitle,
+            content: safeContent,
+            status: todo.status,
+            deadline: todo.whenTime || null,
+            createdAt: createdTs,
+            updatedAt: updatedTs,
+            tags: todo.tags || [],
+            assignee: todo.assignee || null,
+            priority: todo.priority || 'normal',
+            progress: calculateProgress(todo),
+            timeInfo: generateTimeInfo(todo, reminderType),
+            subTasks: todo.subTasks || []
+        },
+        metadata: {
+            source: 'TodoManager',
+            agentName: options.agentName || 'System',
+            timestamp: now,
+            sessionId: options.sessionId || null,
+            messageId: options.messageId || null,
+            format: 'structured'
+        },
+        actions: generateActions(todo, reminderType),
+        display: generateDisplayConfig(todo.priority, reminderType)
+    };
+
+    // 根据提醒类型添加特殊字段
+    if (reminderType === 'overdue') {
+        reminder.data.overdueInfo = generateOverdueInfo(todo);
+    } else if (reminderType === 'daily_summary') {
+        reminder.data.summary = options.summary || null;
+        reminder.data.relatedTodos = options.relatedTodos || [];
+    }
+
+    return reminder;
+}
+
+/**
  * 格式化待办事项用于展示
  * @param {object} todo - 待办对象
  * @param {string} format - 输出格式: 'compact' | 'standard' | 'detailed'
@@ -315,22 +702,36 @@ async function getDailyTodos(args = {}) {
             }
         }
 
+        // 包含未指定日期但未完成的任务（这些任务默认应在今日完成）
+        if (!todo.whenTime && !todo.reminderTime) {
+            return true;
+        }
+
         return false;
     });
 
-    // 按优先级和时间排序
-    todayTodos.sort((a, b) => {
-        const priorityOrder = { high: 3, medium: 2, low: 1 };
-        const priorityDiff = (priorityOrder[b.priority] || 0) - (priorityOrder[a.priority] || 0);
-        if (priorityDiff !== 0) return priorityDiff;
+    // 按优先级和时间排序（有日期的优先按时间，无日期的按优先级）
+    const todosWithDate = todayTodos.filter(t => t.whenTime);
+    const todosWithoutDate = todayTodos.filter(t => !t.whenTime);
 
+    // 有日期的按时间排序
+    todosWithDate.sort((a, b) => {
         if (a.whenTime && b.whenTime) {
             return new Date(a.whenTime) - new Date(b.whenTime);
         }
         return 0;
     });
 
-    if (todayTodos.length === 0) {
+    // 无日期的按优先级排序
+    todosWithoutDate.sort((a, b) => {
+        const priorityOrder = { high: 3, medium: 2, low: 1 };
+        return (priorityOrder[b.priority] || 0) - (priorityOrder[a.priority] || 0);
+    });
+
+    // 合并列表（无日期的排在后面）
+    const sortedTodos = [...todosWithDate, ...todosWithoutDate];
+
+    if (sortedTodos.length === 0) {
         return {
             status: 'success',
             result: `📅 ${now.toLocaleDateString('zh-CN', { timeZone: process.env.TIMEZONE || 'Asia/Shanghai' })}\n\n🎉 太棒了！今天没有待办事项，享受轻松的一天吧！`
@@ -339,17 +740,33 @@ async function getDailyTodos(args = {}) {
 
     const format = args.format || 'compact';
     let result = `📅 ${now.toLocaleDateString('zh-CN', { timeZone: process.env.TIMEZONE || 'Asia/Shanghai' })} - 今日待办清单\n`;
-    result += `\n共有 ${todayTodos.length} 项待办事项\n`;
+    result += `\n共有 ${sortedTodos.length} 项待办事项`;
+
+    // 如果有无日期的任务，添加说明
+    if (todosWithoutDate.length > 0) {
+        result += `\n💡 注：其中 ${todosWithoutDate.length} 项未指定日期，建议今日完成\n`;
+    }
+
+    result += '\n';
 
     if (format === 'compact') {
-        result += '\n';
-        todayTodos.forEach((todo, index) => {
-            result += `${index + 1}. ${formatTodoForDisplay(todo, 'compact')}\n`;
+        sortedTodos.forEach((todo, index) => {
+            let display = formatTodoForDisplay(todo, 'compact');
+            // 为无日期的任务添加特殊标记
+            if (!todo.whenTime) {
+                display = `📋 ${display}`;
+            }
+            result += `${index + 1}. ${display}\n`;
         });
     } else {
         result += `\n${'='.repeat(50)}\n\n`;
-        todayTodos.forEach((todo, index) => {
-            result += `${index + 1}. ${formatTodoForDisplay(todo, format)}\n`;
+        sortedTodos.forEach((todo, index) => {
+            let display = formatTodoForDisplay(todo, format);
+            // 为无日期的任务添加特殊标记
+            if (!todo.whenTime) {
+                display = `📋 【未指定日期，建议今日完成】\n${display}`;
+            }
+            result += `${index + 1}. ${display}\n`;
             result += `\n${'─'.repeat(50)}\n\n`;
         });
     }
@@ -851,6 +1268,7 @@ async function batchDelete(args) {
 /**
  * 提醒待办事项
  * 此命令通常由定时任务系统自动调用
+ * 支持结构化JSON v2.0格式输出和传统文本格式
  */
 async function remindTodo(args) {
     const data = await loadTodos();
@@ -875,6 +1293,24 @@ async function remindTodo(args) {
     const timezone = process.env.TIMEZONE || 'Asia/Shanghai';
     const now = new Date();
 
+    // 检查输出格式（默认v2.0结构化格式）
+    const format = args.format || '2.0';
+
+    if (format === '2.0' || format === 'structured') {
+        // 生成结构化JSON v2.0格式
+        const structuredReminder = generateStructuredReminder(todo, 'normal', {
+            agentName: args.agentName || process.env.DEFAULT_AGENT_NAME || 'System',
+            sessionId: args.sessionId || null,
+            messageId: args.messageId || null
+        });
+
+        return {
+            status: 'success',
+            result: structuredReminder
+        };
+    }
+
+    // 传统v1.0文本格式（向后兼容）
     let result = `⏰ 【待办提醒】\n\n`;
     result += `现在时间: ${now.toLocaleString('zh-CN', { timeZone: timezone })}\n\n`;
     result += formatTodoForDisplay(todo, 'detailed');
@@ -974,5 +1410,43 @@ async function main() {
     }
 }
 
-// 执行主函数
-main();
+// 导出函数供其他模块使用
+module.exports = {
+    // 核心函数
+    createTodo,
+    listTodos,
+    updateTodo,
+    deleteTodo,
+    getTodoDetail,
+    getDailyTodos,
+    remindTodo,
+    batchCreate,
+    batchUpdate,
+    batchDelete,
+
+    // 结构化输出相关函数
+    generateStructuredReminder,
+    generateId,
+    generateReminderId,
+    calculateProgress,
+    generateTimeInfo,
+    generateOverdueInfo,
+    generateActions,
+    generateDisplayConfig,
+    formatTodoForDisplay,
+
+    // 错误处理和兼容性函数
+    detectReminderFormat,
+    safeParseReminder,
+    ERROR_CODES,
+
+    // 工具函数
+    parseDateTime,
+    loadTodos,
+    saveTodos
+};
+
+// 执行主函数（仅在直接运行时）
+if (require.main === module) {
+    main();
+}
