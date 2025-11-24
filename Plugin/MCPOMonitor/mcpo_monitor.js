@@ -20,7 +20,7 @@ class MCPOMonitor {
             'Content-Type': 'application/json',
             'User-Agent': 'VCP-MCPOMonitor/1.0.0'
         };
-        
+
         this.debugMode = (process.env.DebugMode || "false").toLowerCase() === "true";
         this.quickCheck = false; // 快速检查模式标志
     }
@@ -42,25 +42,25 @@ class MCPOMonitor {
     _loadConfig() {
         // 首先尝试加载MCPO插件的配置，实现端口共享
         const dotenv = require('dotenv');
-        
+
         // 加载主配置和当前插件配置
         dotenv.config({ path: path.resolve(__dirname, '../../config.env') });
         dotenv.config({ path: path.join(__dirname, 'config.env') });
-        
+
         // 尝试加载MCPO插件的配置
         const mcpoConfigPath = path.join(__dirname, '../MCPO/config.env');
         if (require('fs').existsSync(mcpoConfigPath)) {
             dotenv.config({ path: mcpoConfigPath });
         }
-        
+
         // 获取端口配置（优先级：MCPOMonitor具体配置 > MCPO插件配置 > 默认值）
         const mcpoPort = process.env.MCPO_PORT || '9000';
         const mcpoHost = process.env.MCPO_HOST;
-        
+
         // 如果指定了完整的HOST URL，解析并更新端口；否则根据端口构造
         let finalMcpoHost;
         let actualPort = parseInt(mcpoPort, 10);
-        
+
         if (mcpoHost && mcpoHost.startsWith('http')) {
             try {
                 const url = new URL(mcpoHost);
@@ -80,7 +80,7 @@ class MCPOMonitor {
         } else {
             finalMcpoHost = `http://0.0.0.0:${actualPort}`;
         }
-        
+
         return {
             MCPO_HOST: finalMcpoHost,
             MCPO_PORT: actualPort, // 使用实际解析的端口
@@ -89,7 +89,7 @@ class MCPOMonitor {
             CACHE_TTL_MINUTES: parseInt(process.env.CACHE_TTL_MINUTES || '2', 10),
             INCLUDE_DETAILED_PARAMS: (process.env.INCLUDE_DETAILED_PARAMS || 'true').toLowerCase() === 'true',
             HEALTH_CHECK_TIMEOUT: parseInt(process.env.HEALTH_CHECK_TIMEOUT || '5000', 10),
-            REFRESH_INTERVAL_CRON: process.env.REFRESH_INTERVAL_CRON || '*/10 * * * * *'
+            REFRESH_INTERVAL_CRON: process.env.REFRESH_INTERVAL_CRON || '0 0 * * * *'
         };
     }
 
@@ -99,8 +99,8 @@ class MCPOMonitor {
         const dotenv = require('dotenv');
         dotenv.config({ path: path.resolve(__dirname, '../../config.env') });
         dotenv.config({ path: path.join(__dirname, 'config.env') });
-        
-        return process.env.REFRESH_INTERVAL_CRON || '*/10 * * * * *';
+
+        return process.env.REFRESH_INTERVAL_CRON || '0 0 * * * *';
     }
 
     _log(level, message, data = null) {
@@ -128,7 +128,7 @@ class MCPOMonitor {
 
         try {
             const response = await fetch(url, requestOptions);
-            
+
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -145,7 +145,7 @@ class MCPOMonitor {
 
     async _checkServerHealth() {
         this._log('info', 'Checking MCPO server health...');
-        
+
         const healthChecks = [
             { name: 'OpenAPI文档', endpoint: '/openapi.json', expectJson: true },
             { name: 'Swagger UI', endpoint: '/docs', expectJson: false }
@@ -165,7 +165,7 @@ class MCPOMonitor {
             if (healthResult.success) {
                 results.serverRunning = true;
                 results.serverVersion = healthResult.data.info?.version || '未知';
-                
+
                 // 解析可用服务
                 const description = healthResult.data.info?.description || '';
                 const servicePattern = /\[([^\]]+)\]\(\/([^/\)]+)\/docs\)/g;
@@ -178,7 +178,7 @@ class MCPOMonitor {
                         status: '检测中...'
                     });
                 }
-                
+
                 this._log('info', `Server health check passed. Found ${results.availableServices.length} services`);
             }
         } catch (error) {
@@ -202,7 +202,7 @@ class MCPOMonitor {
                         timeout: this.config.HEALTH_CHECK_TIMEOUT,
                         headers: { 'Authorization': `Bearer ${this.config.MCPO_API_KEY}` }
                     });
-                    
+
                     results.healthChecks[check.name] = {
                         status: response.ok ? '🟢 正常' : '🔴 异常',
                         details: response.ok ? `HTTP ${response.status}` : `HTTP ${response.status}: ${response.statusText}`
@@ -233,7 +233,7 @@ class MCPOMonitor {
 
     async _getToolDetails() {
         this._log('info', 'Fetching tool details from all services...');
-        
+
         const tools = {};
         const servicesInfo = {};
 
@@ -248,7 +248,7 @@ class MCPOMonitor {
             const servicePattern = /\[([^\]]+)\]\(\/([^/\)]+)\/docs\)/g;
             const services = [];
             let match;
-            
+
             while ((match = servicePattern.exec(description)) !== null) {
                 services.push({
                     name: match[1],
@@ -278,12 +278,12 @@ class MCPOMonitor {
                     };
 
                     const paths = serviceSpec.paths || {};
-                    
+
                     for (const [pathKey, pathValue] of Object.entries(paths)) {
                         if (pathValue.post) {
                             const toolName = pathKey.replace('/', '');
                             const fullToolName = `${service.path}_${toolName}`;
-                            
+
                             const toolInfo = {
                                 name: fullToolName,
                                 originalName: toolName,
@@ -332,7 +332,7 @@ class MCPOMonitor {
 
     _extractParameters(postInfo, serviceSpec) {
         const parameters = {};
-        
+
         try {
             const requestBody = postInfo.requestBody;
             if (!requestBody || !requestBody.content) {
@@ -345,7 +345,7 @@ class MCPOMonitor {
             }
 
             let schema = jsonContent.schema;
-            
+
             // 处理 $ref 引用
             if (schema.$ref) {
                 const refPath = schema.$ref;
@@ -354,7 +354,7 @@ class MCPOMonitor {
 
             if (schema && schema.properties) {
                 const required = schema.required || [];
-                
+
                 for (const [paramName, paramInfo] of Object.entries(schema.properties)) {
                     parameters[paramName] = {
                         type: paramInfo.type || 'string',
@@ -389,7 +389,7 @@ class MCPOMonitor {
         try {
             const exampleParams = {};
             const parameters = this._extractParameters(postInfo, serviceSpec);
-            
+
             for (const [paramName, paramInfo] of Object.entries(parameters)) {
                 if (paramInfo.example !== undefined) {
                     exampleParams[paramName] = paramInfo.example;
@@ -418,8 +418,8 @@ class MCPOMonitor {
                 }
             }
 
-            const argumentsStr = Object.keys(exampleParams).length > 0 
-                ? JSON.stringify(exampleParams, null, 2) 
+            const argumentsStr = Object.keys(exampleParams).length > 0
+                ? JSON.stringify(exampleParams, null, 2)
                 : '{}';
 
             return `<<<[TOOL_REQUEST]>>>
@@ -445,13 +445,13 @@ arguments:「始」{}「末」
 
         // 标题和概览
         report += "# 🔧 MCPO 服务状态监控报告（实时检测）\n\n";
-        
+
         // 服务器状态概览
         report += "## 📊 服务器状态概览\n\n";
         const statusIcon = healthData.serverRunning ? "🟢" : "🔴";
         const statusText = healthData.serverRunning ? "正常运行" : "连接失败";
         report += `**服务器状态**: ${statusIcon} ${statusText}\n`;
-        
+
         if (healthData.serverRunning) {
             report += `**服务器版本**: ${healthData.serverVersion}\n`;
             report += `**可用服务数**: ${healthData.availableServices.length}\n`;
@@ -459,7 +459,7 @@ arguments:「始」{}「末」
                 report += `**总工具数量**: ${toolData.totalTools}\n`;
             }
         }
-        
+
         report += `**检测模式**: 🔄 实时检测 (${this.config.REFRESH_INTERVAL_CRON})\n`;
         report += `**最后检查**: ${new Date(healthData.lastChecked).toLocaleString('zh-CN')}\n\n`;
 
@@ -496,24 +496,24 @@ arguments:「始」{}「末」
         // 工具详情（按服务分组）
         if (toolData.success && toolData.servicesInfo) {
             report += "## 🛠️ 可用工具详情\n\n";
-            
+
             for (const [serviceName, serviceInfo] of Object.entries(toolData.servicesInfo)) {
                 if (serviceInfo.toolCount > 0) {
                     report += `### ${serviceName} 服务工具 (${serviceInfo.toolCount}个)\n\n`;
-                    
+
                     if (serviceInfo.description) {
                         report += `**服务描述**: ${serviceInfo.description}\n\n`;
                     }
-                    
+
                     for (const tool of serviceInfo.tools) {
                         report += `#### ${tool.originalName}\n`;
                         report += `- **完整名称**: \`${tool.name}\`\n`;
                         report += `- **功能**: ${tool.summary}\n`;
-                        
+
                         if (tool.description && tool.description !== tool.summary) {
                             report += `- **详细描述**: ${tool.description}\n`;
                         }
-                        
+
                         // 参数信息
                         if (this.config.INCLUDE_DETAILED_PARAMS && Object.keys(tool.parameters).length > 0) {
                             report += `- **参数**:\n`;
@@ -528,13 +528,13 @@ arguments:「始」{}「末」
                                 }
                             }
                         }
-                        
+
                         // 调用示例
                         report += `- **调用示例**:\n\`\`\`\n${tool.example}\n\`\`\`\n\n`;
                     }
                 }
             }
-            
+
             // 通用调用格式说明
             report += "## 📋 通用调用格式\n\n";
             report += "所有 MCPO 工具都通过以下格式调用:\n\n";
@@ -546,7 +546,7 @@ arguments:「始」{}「末」
             report += "arguments:「始」{\"参数名\": \"参数值\"}「末」\n";
             report += "<<<[END_TOOL_REQUEST]>>>\n";
             report += "```\n\n";
-            
+
             report += "**其他可用操作**:\n";
             report += "- `list_tools`: 列出所有工具\n";
             report += "- `get_tool_info`: 获取指定工具信息\n";
@@ -576,14 +576,14 @@ arguments:「始」{}「末」
 
             const stats = await fs.stat(CACHE_FILE_PATH);
             const ageMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
-            
+
             if (ageMinutes > this.config.CACHE_TTL_MINUTES) {
                 this._log('info', `Cache expired (${ageMinutes.toFixed(1)} minutes old)`);
                 return null;
             }
 
             const cachedData = await fs.readFile(CACHE_FILE_PATH, 'utf-8');
-            
+
             // 验证缓存数据
             if (!cachedData || cachedData.startsWith('[Error') || cachedData.includes('连接失败')) {
                 this._log('info', 'Cache contains error data, ignoring');
@@ -592,7 +592,7 @@ arguments:「始」{}「末」
 
             this._log('info', `Using cached data (${ageMinutes.toFixed(1)} minutes old)`);
             return cachedData.trim();
-            
+
         } catch (error) {
             this._log('warn', 'Error reading cache', { error: error.message });
             return null;
@@ -607,14 +607,14 @@ arguments:「始」{}「末」
         try {
             // 写入格式化文本缓存
             await fs.writeFile(CACHE_FILE_PATH, data, 'utf-8');
-            
+
             // 写入JSON缓存
             if (jsonData) {
                 await fs.writeFile(JSON_CACHE_FILE_PATH, JSON.stringify(jsonData, null, 2), 'utf-8');
             }
-            
+
             this._log('info', 'Cache updated successfully');
-            
+
         } catch (error) {
             this._log('error', 'Error writing cache', { error: error.message });
         }
@@ -656,7 +656,7 @@ curl ${this.config.MCPO_HOST}/openapi.json
         try {
             // 强制进行实时检测，每次都获取最新状态
             this._log('info', 'Performing real-time status check (ignoring cache)...');
-            
+
             // 并行执行健康检查和工具详情获取
             const [healthData, toolData] = await Promise.all([
                 this._checkServerHealth(),
@@ -690,7 +690,7 @@ curl ${this.config.MCPO_HOST}/openapi.json
 
         } catch (error) {
             this._log('error', 'Real-time status monitoring failed', { error: error.message });
-            
+
             // 生成错误报告（包含实时检测失败信息）
             const errorReport = `# ❗ MCPO 服务状态监控报告
 
@@ -737,23 +737,23 @@ curl ${this.config.MCPO_HOST}/openapi.json
 async function main() {
     try {
         const monitor = new MCPOMonitor();
-        
+
         // 输出当前配置信息（仅在调试模式下）
         if (monitor.debugMode) {
             console.error(`[MCPOMonitor] 配置的刷新间隔: ${monitor.config.REFRESH_INTERVAL_CRON}`);
             console.error(`[MCPOMonitor] MCPO服务器: ${monitor.config.MCPO_HOST} (端口: ${monitor.config.MCPO_PORT})`);
             console.error(`[MCPOMonitor] 缓存启用: ${monitor.config.ENABLE_CACHE}`);
         }
-        
+
         const report = await monitor.generateStatusReport();
-        
+
         // 输出到stdout供Plugin.js使用
         process.stdout.write(report);
         process.exit(0);
-        
+
     } catch (error) {
         console.error(`[MCPOMonitor] Fatal error: ${error.message}`);
-        
+
         const errorOutput = `[MCPO监控插件执行失败: ${error.message}]`;
         process.stdout.write(errorOutput);
         process.exit(1);
