@@ -35,7 +35,7 @@
       "default": 9000
     },
     "MCPO_API_KEY": {
-      "type": "string", 
+      "type": "string",
       "description": "MCPO 服务器 API 密钥（与MCPO插件共享配置）",
       "default": "vcp-mcpo-secret"
     },
@@ -50,7 +50,7 @@
       "default": 2
     },
     "INCLUDE_DETAILED_PARAMS": {
-      "type": "boolean", 
+      "type": "boolean",
       "description": "包含详细的参数信息",
       "default": true
     },
@@ -62,8 +62,8 @@
     "REFRESH_INTERVAL_CRON": {
       "type": "string",
       "description": "自动更新间隔（Cron表达式）。默认每10秒更新一次，确保占位符获取实时信息",
-      "default": "*/10 * * * * *"
+      "default": "0 0 * * * *"
     }
   },
-  "refreshIntervalCron": "*/10 * * * * *"
+  "refreshIntervalCron": "0 0 * * * *"
 }
