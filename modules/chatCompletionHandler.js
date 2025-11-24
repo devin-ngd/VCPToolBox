@@ -1595,89 +1595,11 @@ class ChatCompletionHandler {
       }
     } catch (error) {
       if (error.name === 'AbortError') {
-        console.log(`[Abort] Request ${id} was aborted by the user.`);
-        
-        // 修复竞态条件Bug: 检查响应是否已被中断路由关闭
-        if (res.writableEnded || res.destroyed) {
-          console.log(`[Abort] Response already closed by interrupt handler for ${id}.`);
-          return;
-        }
-        
-        // 检查响应头是否已被中断路由发送
-        if (res.headersSent) {
-          console.log(`[Abort] Headers already sent (likely by interrupt handler). Checking response type...`);
-          
-          if (res.getHeader('Content-Type')?.includes('text/event-stream')) {
-            // 流式响应已开始，发送[DONE]信号
-            try {
-              res.write('data: [DONE]\n\n', () => {
-                res.end();
-              });
-            } catch (writeError) {
-              console.error(`[Abort] Error writing [DONE] signal: ${writeError.message}`);
-              if (!res.writableEnded) res.end();
-            }
-          } else {
-            // 非流式响应，中断路由应该已经处理完毕，直接结束
-            console.log(`[Abort] Non-stream response with headers sent. Assuming interrupt handler finished.`);
-            if (!res.writableEnded) res.end();
-          }
-        } else {
-          // 响应头未发送，中断路由可能还没执行或执行失败
-          // 这里等待一小段时间，让中断路由有机会处理
-          console.log(`[Abort] Headers not sent yet. Waiting for interrupt handler...`);
-          setTimeout(() => {
-            try {
-              // 再次检查响应状态
-              if (res.writableEnded || res.destroyed) {
-                console.log(`[Abort] Response was closed by interrupt handler during wait.`);
-                return;
-              }
-              
-              if (!res.headersSent) {
-                // 中断路由没有处理，我们来处理
-                console.log(`[Abort] Interrupt handler didn't process. Handling abort here.`);
-                if (isOriginalRequestStreaming) {
-                  // 流式请求
-                  res.status(200);
-                  res.setHeader('Content-Type', 'text/event-stream');
-                  res.setHeader('Cache-Control', 'no-cache');
-                  res.setHeader('Connection', 'keep-alive');
-                  
-                  const abortChunk = {
-                    id: `chatcmpl-abort-${Date.now()}`,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: originalBody.model || 'unknown',
-                    choices: [{
-                      index: 0,
-                      delta: { content: '请求已被用户中止' },
-                      finish_reason: 'stop'
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(abortChunk)}\n\n`);
-                  res.write('data: [DONE]\n\n');
-                  res.end();
-                } else {
-                  // 非流式请求
-                  res.status(200).json({
-                    choices: [{
-                      index: 0,
-                      message: { role: 'assistant', content: '请求已被用户中止' },
-                      finish_reason: 'stop',
-                    }],
-                  });
-                }
-              }
-            } catch (e) {
-                console.error('[Abort] Error within abort handler timeout:', e.message);
-                if (!res.writableEnded) {
-                    try { res.end(); } catch (endErr) { /* ignore */ }
-                }
-            }
-          }, 50); // 等待50ms让中断路由处理
-        }
-        return;
+        // When a request is aborted, the '/v1/interrupt' handler is responsible for closing the response stream.
+        // This catch block should simply log the event and stop processing to prevent race conditions
+        // and avoid throwing an uncaught exception if it also tries to write to the already-closed stream.
+        console.log(`[Abort] Caught AbortError for request ${id}. Execution will be halted. The interrupt handler is responsible for the client response.`);
+        return; // Stop processing and allow the 'finally' block to clean up.
       }
       // Only log full stack trace for non-abort errors
       console.error('处理请求或转发时出错:', error.message, error.stack);

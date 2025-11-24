@@ -263,6 +263,12 @@ class RAGDiaryPlugin {
         this.embeddingCacheHits = 0; // 统计向量缓存命中次数
         this.embeddingCacheMisses = 0; // 统计向量缓存未命中次数
 
+
+        // ✅ 新增：AIMemo 缓存
+        this.aiMemoCache = new Map();
+        this.aiMemoCacheMaxSize = 50; // 可配置
+        this.aiMemoCacheTTL = 1800000; // 30分钟
+
         // 注意：不在构造函数中调用 loadConfig()，而是在 initialize() 中调用
     }
 
@@ -287,6 +293,11 @@ class RAGDiaryPlugin {
         this.embeddingCacheTTL = parseInt(process.env.EMBEDDING_CACHE_TTL_MS) || 7200000;
         console.log(`[RAGDiaryPlugin] 向量缓存已启用 (最大: ${this.embeddingCacheMaxSize}条, TTL: ${this.embeddingCacheTTL}ms)`);
 
+        // ✅ 从环境变量读取 AIMemo 缓存配置
+        this.aiMemoCacheMaxSize = parseInt(process.env.AIMEMO_CACHE_MAX_SIZE) || 50;
+        this.aiMemoCacheTTL = parseInt(process.env.AIMEMO_CACHE_TTL_MS) || 1800000;
+        console.log(`[RAGDiaryPlugin] AIMemo缓存已启用 (最大: ${this.aiMemoCacheMaxSize}条, TTL: ${this.aiMemoCacheTTL}ms)`);
+
         // --- 加载 Rerank 配置 ---
         this.rerankConfig = {
             url: process.env.RerankUrl || '',
@@ -302,7 +313,8 @@ class RAGDiaryPlugin {
 
         // --- 初始化并加载 AIMemo 配置 ---
         console.log('[RAGDiaryPlugin] Initializing AIMemo handler...');
-        this.aiMemoHandler = new AIMemoHandler(this); // 在环境变量加载后初始化
+        // ✅ 注入 AIMemo 缓存
+        this.aiMemoHandler = new AIMemoHandler(this, this.aiMemoCache);
         await this.aiMemoHandler.loadConfig();
         console.log('[RAGDiaryPlugin] AIMemo handler initialized.');
 
@@ -533,6 +545,10 @@ class RAGDiaryPlugin {
 
         // ✅ 启动向量缓存清理任务
         this._startEmbeddingCacheCleanupTask();
+
+
+        // ✅ 启动 AIMemo 缓存清理任务
+        this._startAiMemoCacheCleanupTask();
 
         console.log('[RAGDiaryPlugin] 插件初始化完成，AIMemoHandler已就绪，查询缓存和向量缓存系统已启动');
     }
@@ -1311,6 +1327,13 @@ class RAGDiaryPlugin {
 
         if (this.pushVcpInfo && finalResultsForBroadcast) {
             try {
+                // ✅ 新增：根据相关度分数对结果进行排序
+                finalResultsForBroadcast.sort((a, b) => {
+                    const scoreA = a.rerank_score ?? a.score ?? -1;
+                    const scoreB = b.rerank_score ?? b.score ?? -1;
+                    return scoreB - scoreA;
+                });
+
                 const cleanedResults = this._cleanResultsForBroadcast(finalResultsForBroadcast);
                 vcpInfoData = {
                     type: 'RAG_RETRIEVAL_DETAILS',
@@ -2172,6 +2195,31 @@ class RAGDiaryPlugin {
             hitRate: `${hitRate}%`,
             ttl: this.cacheTTL
         };
+    }
+
+    //####################################################################################
+    //## AIMemo Cache - AIMemo缓存系统
+    //####################################################################################
+
+    /**
+     * ✅ 定期清理过期AIMemo缓存
+     */
+    _startAiMemoCacheCleanupTask() {
+        setInterval(() => {
+            const now = Date.now();
+            let expiredCount = 0;
+
+            for (const [key, value] of this.aiMemoCache.entries()) {
+                if (now - value.timestamp > this.aiMemoCacheTTL) {
+                    this.aiMemoCache.delete(key);
+                    expiredCount++;
+                }
+            }
+
+            if (expiredCount > 0) {
+                console.log(`[RAGDiaryPlugin] 清理了 ${expiredCount} 条过期AIMemo缓存`);
+            }
+        }, this.aiMemoCacheTTL);
     }
 }
 
