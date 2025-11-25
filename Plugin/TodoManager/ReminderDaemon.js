@@ -75,11 +75,18 @@ const server = http.createServer(async (req, res) => {
                 const data = JSON.parse(body);
                 console.log(`[ReminderDaemon] 收到VCPLog连接通知: ${data.message}`);
 
-                // 立即执行系统启动提醒（仅执行一次）
+                // 延迟3秒后执行系统启动提醒（仅执行一次）
                 if (STARTUP_REMINDER_ENABLED && !startupReminderSent) {
                     startupReminderSent = true;
-                    console.log('[ReminderDaemon] 开始执行系统启动通用提醒');
-                    await checkStartupReminders();
+                    console.log('[ReminderDaemon] 将在3秒后执行系统启动提醒');
+                    setTimeout(async () => {
+                        console.log('[ReminderDaemon] 开始执行系统启动通用提醒');
+                        try {
+                            await checkStartupReminders();
+                        } catch (error) {
+                            console.error(`[ReminderDaemon] 执行系统启动提醒失败: ${error.message}`);
+                        }
+                    }, 3000);
                 }
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
