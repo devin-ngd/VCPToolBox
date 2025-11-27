@@ -248,8 +248,8 @@ async function sendReminderToAgent(todo, agentName = 'Nova', options = {}) {
         if (todo.priority) {
             message += `${priorityEmoji[todo.priority] || '⚪'} 优先级: ${todo.priority}\n`;
         }
-        if (todo.dueDateTime || todo.whenTime) {
-            const dueDate = new Date(todo.dueDateTime || todo.whenTime);
+        if (todo.whenTime) {
+            const dueDate = new Date(todo.whenTime);
             message += `⏱️ 截止时间: ${dueDate.toLocaleString('zh-CN', { timeZone: timezone })}\n`;
             if (dueDate < now) {
                 const overdueDays = Math.floor((now - dueDate) / (1000 * 60 * 60 * 24));
@@ -280,7 +280,7 @@ async function sendReminderToAgent(todo, agentName = 'Nova', options = {}) {
             title: todo.title,
             message: message,
             priority: todo.priority,
-            dueDateTime: todo.dueDateTime || todo.whenTime,
+            whenTime: todo.whenTime,
             tags: todo.tags || [],
             timestamp: now.toISOString()
         };
@@ -310,8 +310,8 @@ function generateDailySummaryData(todos, timezone) {
 
     // 筛选当天的所有任务（包括已完成和未完成）
     const allTodayTodos = todos.filter(todo => {
-        if (!todo.dueDateTime) return false; // 无日期的不算今日任务
-        const dueDate = new Date(todo.dueDateTime);
+        if (!todo.whenTime) return false; // 无日期的不算今日任务
+        const dueDate = new Date(todo.whenTime);
         const localDueDate = new Date(dueDate.toLocaleString('en-US', { timeZone: timezone }));
         return localDueDate >= todayStart && localDueDate <= todayEnd;
     });
@@ -319,15 +319,15 @@ function generateDailySummaryData(todos, timezone) {
     // 筛选已过期的未完成任务（截止日期在今天之前）
     const overdueTodos = todos.filter(todo => {
         if (todo.status === 'completed') return false;
-        if (!todo.dueDateTime) return false;
-        const dueDate = new Date(todo.dueDateTime);
+        if (!todo.whenTime) return false;
+        const dueDate = new Date(todo.whenTime);
         const localDueDate = new Date(dueDate.toLocaleString('en-US', { timeZone: timezone }));
         return localDueDate < todayStart; // 在今天开始之前就是过期
     });
 
     // 筛选无截止日期的未完成任务
     const noDateTodos = todos.filter(todo => {
-        return todo.status !== 'completed' && !todo.dueDateTime;
+        return todo.status !== 'completed' && !todo.whenTime;
     });
 
     // 汇总：当天所有任务 + 逾期未完成 + 无截止日期未完成
@@ -433,24 +433,24 @@ async function checkOverdueTodos() {
         if (todo.status === 'completed') continue;
 
         // 只处理有截止时间的待办
-        if (!todo.dueDateTime) continue;
+        if (!todo.whenTime) continue;
 
         // 初始化截止提醒相关字段
-        if (typeof todo.dueDateReminderSent === 'undefined') {
-            todo.dueDateReminderSent = false;
+        if (typeof todo.whenTimeReminderSent === 'undefined') {
+            todo.whenTimeReminderSent = false;
             dataModified = true;
         }
 
-        const dueDate = new Date(todo.dueDateTime);
+        const dueDate = new Date(todo.whenTime);
 
         // 检查是否已经到达或超过截止时间
         if (now < dueDate) continue;
 
         // 如果已经发送过截止提醒，则跳过
-        if (todo.dueDateReminderSent === true) continue;
+        if (todo.whenTimeReminderSent === true) continue;
 
         // 检查是否需要重试（失败的情况）
-        const lastDueAttemptAt = todo.lastDueDateReminderAttemptAt ? new Date(todo.lastDueDateReminderAttemptAt) : null;
+        const lastDueAttemptAt = todo.lastWhenTimeReminderAttemptAt ? new Date(todo.lastWhenTimeReminderAttemptAt) : null;
         const readyToRetry = !lastDueAttemptAt || (now - lastDueAttemptAt >= RETRY_INTERVAL);
         if (!readyToRetry) continue;
 
@@ -502,18 +502,18 @@ async function checkOverdueTodos() {
         try {
             await sendReminderToAgent(overdueTodo, agentName);
             // 成功
-            todo.dueDateReminderSent = true;
-            todo.dueDateReminderSentAt = now.toISOString();
+            todo.whenTimeReminderSent = true;
+            todo.whenTimeReminderSentAt = now.toISOString();
             todo.updatedAt = now.toISOString();
             overdueRemindersSent++;
             dataModified = true;
         } catch (error) {
             // 失败：记录并等待5分钟后重试
             console.error(`[ReminderDaemon] 发送截止提醒失败: ${error.message}`);
-            todo.dueDateReminderSent = false;
-            todo.dueDateReminderFailCount = (todo.dueDateReminderFailCount || 0) + 1;
-            todo.lastDueDateReminderAttemptAt = now.toISOString();
-            todo.nextDueDateReminderRetryAt = new Date(now.getTime() + RETRY_INTERVAL).toISOString();
+            todo.whenTimeReminderSent = false;
+            todo.whenTimeReminderFailCount = (todo.whenTimeReminderFailCount || 0) + 1;
+            todo.lastWhenTimeReminderAttemptAt = now.toISOString();
+            todo.nextWhenTimeReminderRetryAt = new Date(now.getTime() + RETRY_INTERVAL).toISOString();
             todo.updatedAt = now.toISOString();
             dataModified = true;
         }
@@ -680,16 +680,16 @@ async function startDaemon() {
     // 立即执行一次截止时间检查
     await checkOverdueTodos();
 
-    // 单次提醒已改用定时任务调度器，注释掉此定时检查
-    // setInterval(async () => {
-    //     try {
-    //         await checkAndSendReminders();
-    //     } catch (error) {
-    //         console.error(`[ReminderDaemon] 检查提醒时出错: ${error.message}`);
-    //     }
-    // }, CHECK_INTERVAL);
+    // 设置定时检查（按设置时间提醒）- 每60秒检查一次
+    setInterval(async () => {
+        try {
+            await checkAndSendReminders();
+        } catch (error) {
+            console.error(`[ReminderDaemon] 检查提醒时出错: ${error.message}`);
+        }
+    }, CHECK_INTERVAL);
 
-    // 设置定时检查（截止时间）- 改为每小时检查一次
+    // 设置定时检查（截止时间）- 每60秒检查一次
     setInterval(async () => {
         try {
             await checkOverdueTodos();

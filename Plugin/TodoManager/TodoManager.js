@@ -963,7 +963,7 @@ async function updateTodo(args) {
 
         if (args.status === 'completed' && !todo.completedAt) {
             todo.completedAt = new Date().toISOString();
-            todo.dueDateReminderSent = false;
+            todo.whenTimeReminderSent = false;
             todo.reminderSent = false;
 
             // 如果启用了autoLog，将完成记录写入日记
@@ -973,7 +973,7 @@ async function updateTodo(args) {
             }
         } else if (args.status === 'pending' && oldStatus === 'completed') {
             todo.completedAt = null;
-            todo.dueDateReminderSent = false;
+            todo.whenTimeReminderSent = false;
         }
     }
 
