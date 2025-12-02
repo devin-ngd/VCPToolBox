@@ -7,7 +7,7 @@
 - ❌ 没有指定提醒偏移（`remind` 参数）
 - ❌ 没有指定提醒时间（`reminderTime` 参数）
 
-系统会**自动设置提前15分钟的提醒**。
+系统会**自动设置提前1小时的提醒**。
 
 ## 测试场景
 
@@ -21,10 +21,9 @@ when:「始」明天下午3点「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-**预期结果**：
 - ✅ 创建成功
-- ⏰ 自动设置提醒时间为：明天 14:45（提前15分钟）
-- 📢 提示信息：`已自动设置默认提醒（截止前15分钟）`
+- ⏰ 自动设置提醒时间为：明天 14:00（提前1小时）
+- 📢 提示信息：`已自动设置默认提醒（截止前1小时）`
 - 📁 在 `VCPTimedContacts/` 目录创建任务文件 `todo_remind_{id}.json`
 
 ### 场景 2：创建待办，有截止时间，显式指定提醒
@@ -70,7 +69,7 @@ when:「始」后天上午10点「末」
 
 **预期结果**：
 - ✅ 更新成功
-- ⏰ 自动设置提醒时间为：后天 09:45
+- ⏰ 自动设置提醒时间为：后天 09:00
 - 📁 创建新的定时任务文件
 
 ### 场景 5：截止时间已过期（过去时间）
@@ -85,7 +84,7 @@ when:「始」昨天下午3点「末」
 
 **预期结果**：
 - ✅ 创建成功
-- ❌ 不设置提醒（因为提前15分钟的时间已经过去了）
+- ❌ 不设置提醒（因为提前1小时的时间已经过去了）
 - 📁 不创建定时任务文件
 
 ## 验证步骤
@@ -117,17 +116,17 @@ when:「始」昨天下午3点「末」
 
 在 `TodoManager.js` 中添加了日志：
 ```javascript
-console.log(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${reminderTime}`);
+console.log(`[TodoManager] 为待办自动设置默认提醒时间（截止前1小时）: ${reminderTime}`);
 ```
 
 可在服务器日志中查看是否触发了默认提醒逻辑。
 
 ## 优化建议
 
-如果需要修改默认提醒时间（15分钟），可以：
-1. 在 `config.env` 中添加配置项：`DEFAULT_REMINDER_MINUTES=15`
+如果需要修改默认提醒时间（1小时），可以：
+1. 在 `config.env` 中添加配置项：`DEFAULT_REMINDER_MINUTES=60`
 2. 修改代码读取配置：
    ```javascript
-   const defaultMinutes = parseInt(process.env.DEFAULT_REMINDER_MINUTES || '15', 10);
+   const defaultMinutes = parseInt(process.env.DEFAULT_REMINDER_MINUTES || '60', 10);
    const defaultReminderDate = new Date(whenDate.getTime() - defaultMinutes * 60 * 1000);
    ```

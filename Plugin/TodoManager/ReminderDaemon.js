@@ -36,6 +36,8 @@ const DAEMON_CONFIG_PATH = path.join(__dirname, 'todo-daemon.env');
 // 配置
 const DATA_DIR = path.join(__dirname, 'data');
 const TODOS_FILE = path.join(DATA_DIR, 'todos.json');
+const ARCHIVE_FILE = path.join(DATA_DIR, 'todos_archive.json');
+const ARCHIVE_THRESHOLD_DAYS = 7; // 归档阈值天数
 const CHECK_INTERVAL = 60 * 1000; // 每60秒检查一次
 const DAILY_SUMMARY_HOUR = parseInt(process.env.DAILY_SUMMARY_HOUR || '9', 10); // 默认早上9点
 const STARTUP_REMINDER_ENABLED = process.env.STARTUP_REMINDER_ENABLED !== 'false'; // 默认启用系统启动提醒，除非明确设置为false
@@ -367,18 +369,19 @@ function generateDailySummaryData(todos, timezone) {
  */
 async function checkDailyTodos() {
     const data = await loadTodos();
-    const now = new Date();
     const timezone = process.env.TIMEZONE || 'Asia/Shanghai';
     const agentName = process.env.DEFAULT_AGENT_NAME || 'Nova';
+    const now = new Date();
+    const localNow = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
 
-    // 检查是否到了每日汇总时间（默认早上9点）
-    const currentHour = now.getHours();
+    // 检查是否到了每日汇总时间（按配置的时区判断）
+    const currentHour = localNow.getHours();
     if (currentHour !== DAILY_SUMMARY_HOUR) {
         return; // 不在汇总时间，跳过
     }
 
-    // 获取今天的日期键
-    const todayKey = now.toDateString();
+    // 获取今天的日期键（使用本地时区）
+    const todayKey = localNow.toDateString();
     if (sentDailySummaries.has(todayKey)) {
         return; // 今天已发送过，跳过
     }
@@ -664,6 +667,71 @@ function cleanOldReminders() {
 }
 
 /**
+ * 归档已完成的任务
+ */
+async function archiveCompletedTodos() {
+    console.log('[ReminderDaemon] 开始检查待归档任务...');
+    const now = new Date();
+    const thresholdDate = new Date(now.getTime() - ARCHIVE_THRESHOLD_DAYS * 24 * 60 * 60 * 1000);
+
+    try {
+        // 1. 读取主文件
+        const todosData = await loadTodos();
+        if (!todosData.todos || todosData.todos.length === 0) {
+            return;
+        }
+
+        // 2. 筛选需要归档的任务
+        const todosToArchive = todosData.todos.filter(todo => {
+            if (todo.status !== 'completed') return false;
+            // 使用 completedAt 或 updatedAt 判断
+            const completedTime = todo.completedAt ? new Date(todo.completedAt) : (todo.updatedAt ? new Date(todo.updatedAt) : null);
+            if (!completedTime) return false;
+            return completedTime < thresholdDate;
+        });
+
+        if (todosToArchive.length === 0) {
+            console.log('[ReminderDaemon] 没有需要归档的任务');
+            return;
+        }
+
+        console.log(`[ReminderDaemon] 发现 ${todosToArchive.length} 个任务需要归档`);
+
+        // 3. 读取或初始化归档文件
+        let archiveData = { todos: [] };
+        try {
+            const archiveContent = await fs.readFile(ARCHIVE_FILE, 'utf-8');
+            archiveData = JSON.parse(archiveContent);
+        } catch (error) {
+            // 如果文件不存在，使用默认空结构
+            if (error.code !== 'ENOENT') {
+                console.error(`[ReminderDaemon] 读取归档文件失败: ${error.message}`);
+                throw error; // 关键错误，停止归档
+            }
+        }
+
+        // 4. 添加到归档数据
+        archiveData.todos = [...archiveData.todos, ...todosToArchive];
+
+        // 5. 写入归档文件 (先写归档，确保安全)
+        await fs.writeFile(ARCHIVE_FILE, JSON.stringify(archiveData, null, 2), 'utf-8');
+        console.log(`[ReminderDaemon] 已写入归档文件: ${ARCHIVE_FILE}`);
+
+        // 6. 从主数据中移除
+        const remainingTodos = todosData.todos.filter(todo => !todosToArchive.includes(todo));
+        todosData.todos = remainingTodos;
+
+        // 7. 更新主文件
+        await saveTodos(todosData);
+        console.log(`[ReminderDaemon] 已从主文件中移除归档任务，剩余: ${remainingTodos.length}`);
+        console.log(`[ReminderDaemon] 归档完成`);
+
+    } catch (error) {
+        console.error(`[ReminderDaemon] 归档过程出错: ${error.message}`);
+    }
+}
+
+/**
  * 启动提醒守护进程
  */
 async function startDaemon() {
@@ -715,8 +783,10 @@ async function startDaemon() {
             if (!sentDailySummaries.has(scheduled.toDateString())) {
                 try {
                     await checkDailyTodos();
+                    // 执行归档检查
+                    await archiveCompletedTodos();
                 } catch (error) {
-                    console.error(`[ReminderDaemon] 检查每日待办时出错: ${error.message}`);
+                    console.error(`[ReminderDaemon] 检查每日待办或归档时出错: ${error.message}`);
                 }
             }
         }

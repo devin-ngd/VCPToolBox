@@ -7,6 +7,13 @@ const SmartTimeParser = require('./SmartTimeParser');
 const DATA_DIR = path.join(__dirname, 'data');
 const TODOS_FILE = path.join(DATA_DIR, 'todos.json');
 const TIMED_CONTACTS_DIR = path.join(__dirname, '../../VCPTimedContacts');
+const DEFAULT_REMINDER_OFFSET_MINUTES = (() => {
+    const value = parseInt(process.env.DEFAULT_REMINDER_MINUTES || '60', 10);
+    return Number.isFinite(value) && value > 0 ? value : 60;
+})();
+const DEFAULT_REMINDER_LABEL = DEFAULT_REMINDER_OFFSET_MINUTES % 60 === 0
+    ? `截止前${DEFAULT_REMINDER_OFFSET_MINUTES / 60}小时`
+    : `截止前${DEFAULT_REMINDER_OFFSET_MINUTES}分钟`;
 
 // 初始化智能时间解析器
 const timeParser = new SmartTimeParser(process.env.TIMEZONE || 'Asia/Shanghai');
@@ -126,6 +133,17 @@ function parseDateTime(dateStr, timeStr) {
 
     const date = new Date(dateTimeStr);
     return isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function computeDefaultReminderTime(whenTime) {
+    if (!whenTime) return null;
+    const whenDate = new Date(whenTime);
+    if (isNaN(whenDate.getTime())) return null;
+    const reminderDate = new Date(whenDate.getTime() - DEFAULT_REMINDER_OFFSET_MINUTES * 60 * 1000);
+    if (isNaN(reminderDate.getTime()) || reminderDate <= new Date()) {
+        return null;
+    }
+    return reminderDate.toISOString();
 }
 
 /**
@@ -598,6 +616,10 @@ async function createTodo(args) {
     // 使用智能时间解析器
     let whenTime = null;
     let reminderTime = null;
+    let defaultReminderApplied = false;
+    const remindArgProvided = Object.prototype.hasOwnProperty.call(args, 'remind');
+    const reminderTimeArgProvided = Object.prototype.hasOwnProperty.call(args, 'reminderTime');
+    const reminderExplicitlyProvided = remindArgProvided || reminderTimeArgProvided;
 
     if (args.when) {
         whenTime = timeParser.parse(args.when);
@@ -612,18 +634,17 @@ async function createTodo(args) {
     if (!whenTime && (args.dueDate || args.dueTime)) {
         whenTime = parseDateTime(args.dueDate, args.dueTime);
     }
-    if (!reminderTime && args.reminderTime) {
-        reminderTime = new Date(args.reminderTime).toISOString();
+    if (!reminderTime && reminderTimeArgProvided) {
+        reminderTime = args.reminderTime ? new Date(args.reminderTime).toISOString() : null;
     }
 
-    // 如果有截止时间但没有提醒时间，默认提前15分钟提醒
-    if (whenTime && !reminderTime) {
-        const whenDate = new Date(whenTime);
-        const defaultReminderDate = new Date(whenDate.getTime() - 15 * 60 * 1000); // 提前15分钟
-        // 只有当提醒时间在未来时才设置
-        if (defaultReminderDate > new Date()) {
-            reminderTime = defaultReminderDate.toISOString();
-            console.error(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${reminderTime}`);
+    // 如果有截止时间且未显式指定提醒时间，自动应用默认提醒
+    if (whenTime && !reminderTime && !reminderExplicitlyProvided) {
+        const defaultReminderTime = computeDefaultReminderTime(whenTime);
+        if (defaultReminderTime) {
+            reminderTime = defaultReminderTime;
+            defaultReminderApplied = true;
+            console.error(`[TodoManager] 为待办自动设置默认提醒时间（${DEFAULT_REMINDER_LABEL}）: ${reminderTime}`);
         }
     }
 
@@ -660,10 +681,10 @@ async function createTodo(args) {
         const timezone = process.env.TIMEZONE || 'Asia/Shanghai';
 
         // 判断是否为默认提醒（没有显式指定 remind 或 reminderTime）
-        const isDefaultReminder = !args.remind && !args.reminderTime;
+        const isDefaultReminder = (!args.remind && !reminderTimeArgProvided) || defaultReminderApplied;
 
-        if (isDefaultReminder) {
-            result += `\n\n⏰ 已自动设置默认提醒（截止前15分钟）：${reminderDate.toLocaleString('zh-CN', { timeZone: timezone })}`;
+        if (isDefaultReminder && !reminderTimeArgProvided) {
+            result += `\n\n⏰ 已自动设置默认提醒（${DEFAULT_REMINDER_LABEL}）：${reminderDate.toLocaleString('zh-CN', { timeZone: timezone })}`;
             result += `\n💡 提示：可使用 remind 参数自定义提醒时间，如 remind:「始」提前30分钟「末」`;
         } else {
             result += `\n\n⏰ 系统将通过定时任务在 ${reminderDate.toLocaleString('zh-CN', { timeZone: timezone })} 提醒您。`;
@@ -899,6 +920,10 @@ async function updateTodo(args) {
     }
 
     const todo = data.todos[todoIndex];
+    const hasRemindArg = Object.prototype.hasOwnProperty.call(args, 'remind');
+    const hasReminderTimeArg = Object.prototype.hasOwnProperty.call(args, 'reminderTime');
+    const reminderInstructionsProvided = hasRemindArg || hasReminderTimeArg;
+    const dueDateChanged = Boolean(args.when) || Object.prototype.hasOwnProperty.call(args, 'dueDate') || Object.prototype.hasOwnProperty.call(args, 'dueTime');
 
     // 更新字段
     if (args.title) todo.title = args.title;
@@ -910,7 +935,6 @@ async function updateTodo(args) {
 
     // 使用智能时间解析更新时间
     let reminderTimeChanged = false;
-    const oldReminderTime = todo.reminderTime;
 
     if (args.when) {
         todo.whenTime = timeParser.parse(args.when);
@@ -919,18 +943,6 @@ async function updateTodo(args) {
         if (args.remind) {
             todo.reminderTime = timeParser.calculateReminderTime(todo.whenTime, args.remind);
             reminderTimeChanged = true;
-        } else if (!args.reminderTime) {
-            // 如果更新了截止时间但没有指定新的提醒偏移或提醒时间
-            // 且原来没有提醒时间，则设置默认提醒（提前15分钟）
-            if (!todo.reminderTime && todo.whenTime) {
-                const whenDate = new Date(todo.whenTime);
-                const defaultReminderDate = new Date(whenDate.getTime() - 15 * 60 * 1000);
-                if (defaultReminderDate > new Date()) {
-                    todo.reminderTime = defaultReminderDate.toISOString();
-                    reminderTimeChanged = true;
-                    console.error(`[TodoManager] 为待办自动设置默认提醒时间（截止前15分钟）: ${todo.reminderTime}`);
-                }
-            }
         }
     }
 
@@ -941,7 +953,16 @@ async function updateTodo(args) {
         todo.whenTime = parseDateTime(dueDate, dueTime);
     }
 
-    if (args.reminderTime !== undefined) {
+    if (dueDateChanged && todo.whenTime && !reminderInstructionsProvided) {
+        const defaultReminderTime = computeDefaultReminderTime(todo.whenTime);
+        if (defaultReminderTime && todo.reminderTime !== defaultReminderTime) {
+            todo.reminderTime = defaultReminderTime;
+            reminderTimeChanged = true;
+            console.error(`[TodoManager] 为待办自动设置默认提醒时间（${DEFAULT_REMINDER_LABEL}）: ${todo.reminderTime}`);
+        }
+    }
+
+    if (hasReminderTimeArg) {
         todo.reminderTime = args.reminderTime ? new Date(args.reminderTime).toISOString() : null;
         reminderTimeChanged = true;
     }
@@ -1115,11 +1136,25 @@ async function batchCreate(args) {
 
             let whenTime = null;
             let reminderTime = null;
+            const remindArgProvided = Object.prototype.hasOwnProperty.call(todoArgs, 'remind');
+            const reminderTimeArgProvided = Object.prototype.hasOwnProperty.call(todoArgs, 'reminderTime');
 
             if (todoArgs.when) {
                 whenTime = timeParser.parse(todoArgs.when);
                 if (todoArgs.remind) {
                     reminderTime = timeParser.calculateReminderTime(whenTime, todoArgs.remind);
+                }
+            }
+
+            if (!reminderTime && reminderTimeArgProvided) {
+                reminderTime = todoArgs.reminderTime ? new Date(todoArgs.reminderTime).toISOString() : null;
+            }
+
+            if (whenTime && !reminderTime && !remindArgProvided && !reminderTimeArgProvided) {
+                const defaultReminderTime = computeDefaultReminderTime(whenTime);
+                if (defaultReminderTime) {
+                    reminderTime = defaultReminderTime;
+                    console.error(`[TodoManager] 为批量创建的待办自动设置默认提醒时间（${DEFAULT_REMINDER_LABEL}）: ${reminderTime}`);
                 }
             }
 

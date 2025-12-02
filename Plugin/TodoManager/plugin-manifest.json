@@ -35,7 +35,7 @@
     "invocationCommands": [
       {
         "commandIdentifier": "CreateTodo",
-        "description": "创建待办事项\n\n🎯 核心理念：统一时间语义，为AI减负\n\n✨ 智能时间解析（支持自然语言）：\n- '今天'、'明天'、'后天'\n- '下周五'、'下个月'\n- '3天后'、'2小时后'\n- '明天下午3点'\n- '周五下午6点'\n- 也支持标准格式：'2025-10-30 15:00'\n\n⏰ 智能提醒：\n- 如果设置了截止时间但未指定提醒，会自动提前15分钟提醒\n- 可通过 remind 参数自定义提醒时间偏移\n- 提醒通过VCP定时任务调度器精确执行\n\n参数：\n- title (必需): 标题\n- when (推荐): 时间（自然语言或标准格式）\n- remind (可选): 提醒偏移，如'提前10分钟'，不指定则默认提前15分钟\n- description (可选): 描述\n- priority (可选): high/medium/low，默认medium\n- tags (可选): 标签，逗号分隔\n- autoLog (可选): true时完成后自动写入日记\n- format (可选): compact/standard/detailed，输出格式",
+        "description": "创建待办事项\n\n🎯 核心理念：统一时间语义，为AI减负\n\n✨ 智能时间解析（支持自然语言）：\n- '今天'、'明天'、'后天'\n- '下周五'、'下个月'\n- '3天后'、'2小时后'\n- '明天下午3点'\n- '周五下午6点'\n- 也支持标准格式：'2025-10-30 15:00'\n\n⏰ 智能提醒：\n- 如果设置了截止时间但未指定提醒，会自动提前1小时提醒\n- 可通过 remind 参数自定义提醒时间偏移\n- 提醒通过VCP定时任务调度器精确执行\n\n参数：\n- title (必需): 标题\n- when (推荐): 时间（自然语言或标准格式）\n- remind (可选): 提醒偏移，如'提前10分钟'，不指定则默认提前1小时\n- description (可选): 描述\n- priority (可选): high/medium/low，默认medium\n- tags (可选): 标签，逗号分隔\n- autoLog (可选): true时完成后自动写入日记\n- format (可选): compact/standard/detailed，输出格式",
         "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」TodoManager「末」,\ncommand:「始」CreateTodo「末」,\ntitle:「始」团队会议「末」,\nwhen:「始」明天下午3点「末」,\nremind:「始」提前10分钟「末」,\npriority:「始」high「末」,\nautoLog:「始」true「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
