@@ -169,7 +169,9 @@ else console.log('未加载任何全局上下文转换规则。');
 
 
 const app = express();
-app.set('trust proxy', true); // 新增：信任代理，以便正确解析 X-Forwarded-For 头，解决本地IP识别为127.0.0.1的问题
+// 注意：trust proxy 可能导致本地访问时 req.ip 解析缓慢
+// 仅在确实通过反向代理（如 Nginx）访问时才启用
+// app.set('trust proxy', true);
 app.use(cors({ origin: '*' })); // 启用 CORS，允许所有来源的跨域请求，方便本地文件调试
 
 // 在路由决策之前解析请求体，以便 req.body 可用
