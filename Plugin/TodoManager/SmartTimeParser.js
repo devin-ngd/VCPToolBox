@@ -39,6 +39,7 @@ class SmartTimeParser {
         let hasTime = false;
         let hour = 9;
         let minute = 0;
+        let hasExplicitDate = false; // 是否明确指定了日期
 
         // 解析时间部分（如"下午3点"、"15:30"）
         // 注意：需要先匹配带具体时间的模式，再匹配纯时段词，最后匹配纯数字模式
@@ -65,7 +66,7 @@ class SmartTimeParser {
             { regex: /傍晚|黄昏/, handler: () => { hour = 18; minute = 0; hasTime = true; } },
             { regex: /晚上/, handler: () => { hour = 21; minute = 0; hasTime = true; } },
 
-            // 纯数字模式（优先级最低）
+            // 纯数字模式（优先级最低，需要智能判断上下午）
             { regex: /(\d{1,2}):(\d{2})/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
@@ -81,19 +82,25 @@ class SmartTimeParser {
 
         // 解析日期部分
         if (text.includes('今天') || text.includes('今日')) {
+            hasExplicitDate = true;
             // 今天，保持targetDate不变
         } else if (text.includes('明天') || text.includes('明日')) {
+            hasExplicitDate = true;
             targetDate.setDate(targetDate.getDate() + 1);
         } else if (text.includes('后天')) {
+            hasExplicitDate = true;
             targetDate.setDate(targetDate.getDate() + 2);
         } else if (text.includes('大后天')) {
+            hasExplicitDate = true;
             targetDate.setDate(targetDate.getDate() + 3);
         } else if (text.includes('昨天')) {
+            hasExplicitDate = true;
             targetDate.setDate(targetDate.getDate() - 1);
         } else {
             // 匹配"N天后"、"N小时后"等
             const daysMatch = text.match(/(\d+)\s*天[\u540e\u4e4b]?/);
             if (daysMatch) {
+                hasExplicitDate = true;
                 targetDate.setDate(targetDate.getDate() + parseInt(daysMatch[1]));
             }
 
@@ -119,6 +126,7 @@ class SmartTimeParser {
 
             for (const [weekdayStr, targetWeekday] of Object.entries(weekdayMap)) {
                 if (text.includes(weekdayStr)) {
+                    hasExplicitDate = true;
                     const currentWeekday = targetDate.getDay();
                     let daysToAdd = targetWeekday - currentWeekday;
 
@@ -137,14 +145,55 @@ class SmartTimeParser {
 
             // 匹配"下周"、"下个月"
             if (text.includes('下周') && !Object.keys(weekdayMap).some(w => text.includes(w))) {
+                hasExplicitDate = true;
                 targetDate.setDate(targetDate.getDate() + 7);
             } else if (text.includes('下个月') || text.includes('下月')) {
+                hasExplicitDate = true;
                 targetDate.setMonth(targetDate.getMonth() + 1);
             }
         }
 
-        // 设置时间
-        if (hasTime) {
+        // 智能判断上下午（仅当纯数字输入且未明确指定上下午时）
+        if (hasTime && hour >= 0 && hour <= 23) {
+            const hasAmPmKeyword = /上午|下午|晚上|凌晨|早上|清晨|早晨|中午|傍晚|黄昏|深夜|半夜/.test(text);
+
+            if (!hasAmPmKeyword) {
+                // 纯数字输入，需要智能判断
+                let adjustedHour = hour;
+
+                // 1. 11、12点默认为上午（除非明确说半夜）
+                if (hour === 11 || hour === 12) {
+                    adjustedHour = hour;
+                }
+                // 2. 0-7点默认为下午（除非明确说凌晨）
+                else if (hour >= 0 && hour <= 7) {
+                    adjustedHour = hour + 12;
+                }
+                // 3. 8-10点默认为上午
+                else if (hour >= 8 && hour <= 10) {
+                    adjustedHour = hour;
+                }
+                // 4. 13-23点保持原样（已经是24小时制）
+                else if (hour >= 13 && hour <= 23) {
+                    adjustedHour = hour;
+                }
+
+                // 设置调整后的时间
+                targetDate.setHours(adjustedHour, minute, 0, 0);
+
+                // 如果没有明确指定日期，确保解析的时间在当前时间之后
+                if (!hasExplicitDate) {
+                    if (targetDate.getTime() <= now.getTime()) {
+                        // 如果解析的时间已经过去，则认为是指明天
+                        targetDate.setDate(targetDate.getDate() + 1);
+                    }
+                }
+            } else {
+                // 有明确的上下午关键词，直接设置时间
+                targetDate.setHours(hour, minute, 0, 0);
+            }
+        } else if (hasTime) {
+            // 设置时间
             targetDate.setHours(hour, minute, 0, 0);
         } else {
             // 如果没有指定时间，默认设为9:00
