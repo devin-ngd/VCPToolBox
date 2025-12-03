@@ -41,16 +41,31 @@ class SmartTimeParser {
         let minute = 0;
 
         // 解析时间部分（如"下午3点"、"15:30"）
-        // 注意：需要先匹配带上下午/晚上等前缀的模式，再匹配纯数字模式
+        // 注意：需要先匹配带具体时间的模式，再匹配纯时段词，最后匹配纯数字模式
         const timePatterns = [
+            // 带具体时间的模式（优先级最高）
             { regex: /下午(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /下午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = 0; hasTime = true; } },
             { regex: /上午(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /上午(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
             { regex: /晚上(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /晚上(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = 0; hasTime = true; } },
+            { regex: /凌晨(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
+            { regex: /凌晨(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
+            { regex: /傍晚(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = parseInt(m[2]); hasTime = true; } },
+            { regex: /傍晚(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]) + (parseInt(m[1]) < 12 ? 12 : 0); minute = 0; hasTime = true; } },
+
+            // 纯时段词（默认时间）
+            { regex: /深夜|半夜/, handler: () => { hour = 23; minute = 0; hasTime = true; } },
+            { regex: /凌晨/, handler: () => { hour = 2; minute = 0; hasTime = true; } },
+            { regex: /早上|清晨|早晨/, handler: () => { hour = 8; minute = 0; hasTime = true; } },
+            { regex: /上午/, handler: () => { hour = 10; minute = 30; hasTime = true; } },
             { regex: /中午/, handler: () => { hour = 12; minute = 0; hasTime = true; } },
-            { regex: /早上/, handler: () => { hour = 8; minute = 0; hasTime = true; } },
+            { regex: /下午/, handler: () => { hour = 15; minute = 0; hasTime = true; } },
+            { regex: /傍晚|黄昏/, handler: () => { hour = 18; minute = 0; hasTime = true; } },
+            { regex: /晚上/, handler: () => { hour = 21; minute = 0; hasTime = true; } },
+
+            // 纯数字模式（优先级最低）
             { regex: /(\d{1,2}):(\d{2})/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点(\d{1,2})分/, handler: (m) => { hour = parseInt(m[1]); minute = parseInt(m[2]); hasTime = true; } },
             { regex: /(\d{1,2})点/, handler: (m) => { hour = parseInt(m[1]); minute = 0; hasTime = true; } },
