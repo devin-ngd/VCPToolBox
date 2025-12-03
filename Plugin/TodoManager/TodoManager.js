@@ -2,6 +2,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 const SmartTimeParser = require('./SmartTimeParser');
+const fileLock = require('./FileLock');
 
 // 数据文件路径
 const DATA_DIR = path.join(__dirname, 'data');
@@ -96,19 +97,51 @@ async function ensureDataFile() {
 }
 
 /**
- * 读取所有待办事项
+ * 读取所有待办事项（无锁，内部使用）
  */
-async function loadTodos() {
+async function _loadTodosUnsafe() {
     await ensureDataFile();
     const content = await fs.readFile(TODOS_FILE, 'utf-8');
     return JSON.parse(content);
 }
 
 /**
- * 保存所有待办事项
+ * 保存所有待办事项（无锁，内部使用）
+ */
+async function _saveTodosUnsafe(data) {
+    await fs.writeFile(TODOS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+/**
+ * 读取所有待办事项（带锁保护）- 仅用于简单读取
+ */
+async function loadTodos() {
+    return await fileLock.withLock('todos', async () => {
+        return await _loadTodosUnsafe();
+    });
+}
+
+/**
+ * 保存所有待办事项（带锁保护）- 仅用于简单保存
  */
 async function saveTodos(data) {
-    await fs.writeFile(TODOS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    await fileLock.withLock('todos', async () => {
+        await _saveTodosUnsafe(data);
+    });
+}
+
+/**
+ * 在锁保护下执行完整的读-改-写操作
+ * @param {Function} fn - 接收 data 参数并修改它的函数
+ * @returns {Promise<any>} fn 的返回值
+ */
+async function withTodosTransaction(fn) {
+    return await fileLock.withLock('todos', async () => {
+        const data = await _loadTodosUnsafe();
+        const result = await fn(data);
+        await _saveTodosUnsafe(data);
+        return result;
+    });
 }
 
 /**
@@ -607,8 +640,6 @@ function formatTodoForDisplay(todo, format = 'standard') {
  * 创建待办事项
  */
 async function createTodo(args) {
-    const data = await loadTodos();
-
     if (!args.title) {
         throw new Error('标题是必需的参数');
     }
@@ -664,8 +695,10 @@ async function createTodo(args) {
         reflection: null
     };
 
-    data.todos.push(todo);
-    await saveTodos(data);
+    // 使用事务保护读-改-写操作
+    await withTodosTransaction(async (data) => {
+        data.todos.push(todo);
+    });
 
     // 如果设置了提醒时间，创建定时任务
     if (todo.reminderTime) {

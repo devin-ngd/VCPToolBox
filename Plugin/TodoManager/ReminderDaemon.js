@@ -1,6 +1,7 @@
 const fs = require('fs').promises;
 const path = require('path');
 const http = require('http');
+const fileLock = require('./FileLock');
 
 // 自动加载本地环境配置文件
 const DAEMON_CONFIG_PATH = path.join(__dirname, 'todo-daemon.env');
@@ -112,26 +113,35 @@ server.listen(REMINDER_HTTP_PORT, () => {
 });
 
 /**
- * 读取待办数据
+ * 读取待办数据（带锁保护）
  */
 async function loadTodos() {
-    try {
-        const content = await fs.readFile(TODOS_FILE, 'utf-8');
-        return JSON.parse(content);
-    } catch (error) {
-        console.error(`[ReminderDaemon] 读取待办文件失败: ${error.message}`);
-        return { todos: [] };
-    }
+    return await fileLock.withLock('todos', async () => {
+        try {
+            const content = await fs.readFile(TODOS_FILE, 'utf-8');
+            return JSON.parse(content);
+        } catch (error) {
+            console.error(`[ReminderDaemon] 读取待办文件失败: ${error.message}`);
+            return { todos: [] };
+        }
+    });
 }
 
 /**
- * 保存待办数据
+ * 保存待办数据（带锁保护）
  */
 async function saveTodos(data) {
-    try {
-        await fs.mkdir(DATA_DIR, { recursive: true });
-        await fs.writeFile(TODOS_FILE, JSON.stringify(data, null, 2), 'utf-8');
-        return true;
+    return await fileLock.withLock('todos', async () => {
+        try {
+            await fs.mkdir(DATA_DIR, { recursive: true });
+            await fs.writeFile(TODOS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+            return true;
+        } catch (error) {
+            console.error(`[ReminderDaemon] 保存待办文件失败: ${error.message}`);
+            return false;
+        }
+    });
+}
     } catch (error) {
         console.error(`[ReminderDaemon] 写入待办文件失败: ${error.message}`);
         return false;
