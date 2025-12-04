@@ -163,6 +163,7 @@ Plugin/WeatherReporter/weather_cache.txt
 
 # 忽略通用表情包目录下的所有内容...
 image/通用表情包/*
+image/zimagegen/*
 
 # ...除了这两个文件
 !image/通用表情包/阿库娅-一脸智障.jpg
