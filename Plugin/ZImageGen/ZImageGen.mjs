@@ -11,13 +11,15 @@ const {
     PROJECT_BASE_PATH,
     SERVER_PORT,
     IMAGESERVER_IMAGE_KEY,
-    VAR_HTTP_URL
+    VAR_HTTP_URL,
+    HF_TOKEN
 } = (() => {
     return {
         PROJECT_BASE_PATH: process.env.PROJECT_BASE_PATH || '.',
         SERVER_PORT: process.env.SERVER_PORT || '3000',
         IMAGESERVER_IMAGE_KEY: process.env.IMAGESERVER_IMAGE_KEY || 'default_key',
-        VAR_HTTP_URL: process.env.VarHttpUrl || 'http://localhost'
+        VAR_HTTP_URL: process.env.VarHttpUrl || 'http://localhost',
+        HF_TOKEN: process.env.HF_TOKEN || ''
     };
 })();
 
@@ -32,9 +34,9 @@ const API_BASE_URL = 'https://mrfakename-z-image-turbo.hf.space/gradio_api';
  */
 function parseResolution(resolution) {
     if (!resolution) return { width: 1024, height: 1024 };
-    
+
     const res = resolution.toLowerCase().trim();
-    
+
     // 预设比例
     const presets = {
         'square': { width: 1024, height: 1024 },
@@ -46,15 +48,15 @@ function parseResolution(resolution) {
         '3:4': { width: 864, height: 1152 },
         '1:1': { width: 1024, height: 1024 }
     };
-    
+
     if (presets[res]) return presets[res];
-    
+
     // 解析 WxH 格式
     const match = res.match(/(\d+)\s*[x×]\s*(\d+)/i);
     if (match) {
         return { width: parseInt(match[1]), height: parseInt(match[2]) };
     }
-    
+
     return { width: 1024, height: 1024 };
 }
 
@@ -75,7 +77,7 @@ async function callGradioApi(args) {
         data: [
             prompt,           // prompt: string
             height,           // height: number
-            width,            // width: number  
+            width,            // width: number
             steps,            // num_inference_steps: number
             seed,             // seed: number
             randomSeed        // randomize_seed: boolean
@@ -83,8 +85,13 @@ async function callGradioApi(args) {
     };
 
     try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (HF_TOKEN) {
+            headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+        }
+
         const response = await axios.post(`${API_BASE_URL}/call/generate_image`, payload, {
-            headers: { 'Content-Type': 'application/json' }
+            headers: headers
         });
         const eventId = response.data.event_id;
 
@@ -102,11 +109,16 @@ async function callGradioApi(args) {
  */
 async function listenForResult(eventId) {
     const eventSourceUrl = `${API_BASE_URL}/call/generate_image/${eventId}`;
-    
+
     try {
+        const headers = { 'Accept': 'text/event-stream' };
+        if (HF_TOKEN) {
+            headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+        }
+
         const response = await axios.get(eventSourceUrl, {
             responseType: 'stream',
-            headers: { 'Accept': 'text/event-stream' },
+            headers: headers,
             timeout: 240000 // 4分钟超时
         });
 
@@ -115,7 +127,7 @@ async function listenForResult(eventId) {
 
         for await (const chunk of stream) {
             buffer += chunk.toString();
-            
+
             while (buffer.includes('\n\n')) {
                 const index = buffer.indexOf('\n\n');
                 const message = buffer.substring(0, index);
@@ -142,9 +154,9 @@ async function listenForResult(eventId) {
                     if (Array.isArray(data) && data.length >= 2) {
                         const imageResult = data[0];
                         const seedUsed = data[1];
-                        
+
                         let downloadUrl = null;
-                        
+
                         // 处理不同的返回格式
                         if (typeof imageResult === 'string') {
                             downloadUrl = imageResult;
@@ -153,7 +165,7 @@ async function listenForResult(eventId) {
                         } else if (imageResult && imageResult.path) {
                             downloadUrl = `${API_BASE_URL}/file=${imageResult.path}`;
                         }
-                        
+
                         if (downloadUrl) {
                             return { imageUrl: downloadUrl, seed: seedUsed };
                         }
@@ -161,7 +173,7 @@ async function listenForResult(eventId) {
                 }
             }
         }
-        
+
         throw new Error('SSE 流已结束但未收到完成事件');
 
     } catch (err) {
@@ -175,11 +187,19 @@ async function listenForResult(eventId) {
  * @returns {Promise<object>} - 本地文件信息
  */
 async function saveImage(imageUrl) {
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    const headers = {};
+    if (HF_TOKEN) {
+        headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+    }
+
+    const response = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        headers: headers
+    });
     const buffer = response.data;
     const mimeType = response.headers['content-type'] || 'image/png';
     const extension = mimeType.split('/')[1] || 'png';
-    
+
     const generatedFileName = `${uuidv4()}.${extension}`;
     const imageDir = path.join(PROJECT_BASE_PATH, 'image', 'zimagegen');
     const localImagePath = path.join(imageDir, generatedFileName);
@@ -239,7 +259,7 @@ async function generateImage(args) {
 
 async function main() {
     let inputData = '';
-    
+
     // 设置全局超时，防止进程无限挂起
     const timeout = setTimeout(() => {
         console.log(JSON.stringify({ status: "error", error: "ZImageGen 插件执行超时 (5分钟)" }));
@@ -254,13 +274,13 @@ async function main() {
         if (!inputData.trim()) {
             throw new Error("未从 stdin 接收到任何输入数据。");
         }
-        
+
         const parsedArgs = JSON.parse(inputData);
         let resultObject;
 
         // 兼容多种命令格式：command='generate' 或直接传prompt
         const command = parsedArgs.command || (parsedArgs.prompt ? 'generate' : undefined);
-        
+
         if (command === 'generate' || command === 'ZImageGenerate') {
             resultObject = await generateImage(parsedArgs);
         } else {
