@@ -66,7 +66,11 @@ class PluginManager {
 
         if (pluginManifest.configSchema) {
             for (const key in pluginManifest.configSchema) {
-                const expectedType = pluginManifest.configSchema[key];
+                const schemaEntry = pluginManifest.configSchema[key];
+                // 兼容两种格式：对象格式 { type: "string", ... } 和简单字符串格式 "string"
+                const expectedType = (typeof schemaEntry === 'object' && schemaEntry !== null)
+                    ? schemaEntry.type
+                    : schemaEntry;
                 let rawValue;
 
                 if (pluginSpecificEnv.hasOwnProperty(key)) {

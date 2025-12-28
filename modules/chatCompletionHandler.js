@@ -1,9 +1,11 @@
 // modules/chatCompletionHandler.js
 const messageProcessor = require('./messageProcessor.js');
 const vcpInfoHandler = require('../vcpInfoHandler.js');
+const contextManager = require('./contextManager.js');
 const fs = require('fs').promises;
 const path = require('path');
 const { getAuthCode} = require('./captchaDecoder'); // 导入统一的解码函数
+const { StringDecoder } = require('string_decoder'); // 修复中文编码截断问题
 
 async function getRealAuthCode(debugMode = false) {
   try {
@@ -65,7 +67,6 @@ async function fetchWithRetry(
   throw new Error('Fetch failed after all retries.');
 }
 // 辅助函数：根据新上下文刷新对话历史中的RAG区块
-// 辅助函数：根据新上下文刷新对话历史中的RAG区块
 async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, debugMode = false) {
     const ragPlugin = pluginManager.messagePreprocessors?.get('RAGDiaryPlugin');
     // 检查插件是否存在且是否实现了refreshRagBlock方法
@@ -116,8 +117,27 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
                             console.log(`[VCP Refresh] 正在刷新区块 (${metadata.dbName})...`);
                         }
 
-                        // 调用 RAG 插件的刷新接口
-                        const newBlock = await ragPlugin.refreshRagBlock(metadata, newContext);
+                        // V4.0: Find the last *true* user message to use as the original query
+                        let originalUserQuery = '';
+                        // Search backwards from the message *before* the one containing the RAG block
+                        for (let j = i - 1; j >= 0; j--) {
+                            const prevMsg = newMessages[j];
+                            if (prevMsg.role === 'user' && typeof prevMsg.content === 'string' &&
+                                !prevMsg.content.startsWith('<!-- VCP_TOOL_PAYLOAD -->') &&
+                                !prevMsg.content.startsWith('[系统提示:]') &&
+                                !prevMsg.content.startsWith('[系统邀请指令:]')
+                            ) {
+                                originalUserQuery = prevMsg.content;
+                                if (debugMode) console.log(`[VCP Refresh] Found original user query for refresh at index ${j}.`);
+                                break; // Found it, stop searching
+                            }
+                        }
+                        if (!originalUserQuery && debugMode) {
+                            console.warn(`[VCP Refresh] Could not find a true user query for the RAG block at index ${i}. Refresh may be inaccurate.`);
+                        }
+
+                        // 调用 RAG 插件的刷新接口, now with originalUserQuery
+                        const newBlock = await ragPlugin.refreshRagBlock(metadata, newContext, originalUserQuery);
                         
                         // 🟢 改进点4：关键修复！使用回调函数进行替换，防止 newBlock 中的 "$" 符号被解析为正则特殊字符
                         // 这是一个极其常见的 Bug，导致包含 $ 的内容（如公式、代码）替换失败或乱码
@@ -189,6 +209,28 @@ class ChatCompletionHandler {
 
     let originalBody = req.body;
     const isOriginalRequestStreaming = originalBody.stream === true;
+
+    // --- 上下文控制 (Context Control) ---
+    // 1. 拦截 contextTokenLimit 参数
+    const contextTokenLimit = originalBody.contextTokenLimit;
+    if (contextTokenLimit !== undefined) {
+        if (DEBUG_MODE) console.log(`[ContextControl] 检测到 contextTokenLimit: ${contextTokenLimit}`);
+        // 2. 从发送给后端的 body 中移除该参数
+        delete originalBody.contextTokenLimit;
+
+        // 3. 执行上下文修剪
+        if (originalBody.messages && Array.isArray(originalBody.messages)) {
+            const originalCount = originalBody.messages.length;
+            originalBody.messages = contextManager.pruneMessages(
+                originalBody.messages,
+                contextTokenLimit,
+                DEBUG_MODE
+            );
+            if (DEBUG_MODE && originalBody.messages.length < originalCount) {
+                console.log(`[ContextControl] 上下文已修剪: ${originalCount} -> ${originalBody.messages.length} 条消息`);
+            }
+        }
+    }
 
     try {
       if (originalBody.model) {
@@ -437,6 +479,7 @@ class ChatCompletionHandler {
         // Helper function to process an AI response stream
         async function processAIResponseStreamHelper(aiResponse, isInitialCall) {
           return new Promise((resolve, reject) => {
+            const decoder = new StringDecoder('utf8'); // 修复中文编码截断问题：初始化解码器
             let sseBuffer = ''; // Buffer for incomplete SSE lines
             let collectedContentThisTurn = ''; // Collects textual content from delta
             let rawResponseDataThisTurn = ''; // Collects all raw chunks for diary
@@ -464,7 +507,9 @@ class ChatCompletionHandler {
             aiResponse.body.on('data', chunk => {
               // 修复 Bug #5: 如果已中止，忽略后续数据
               if (streamAborted) return;
-              const chunkString = chunk.toString('utf-8');
+              
+              // 修复中文编码截断问题：使用 decoder.write 代替 chunk.toString
+              const chunkString = decoder.write(chunk);
               rawResponseDataThisTurn += chunkString;
               sseLineBuffer += chunkString;
 
@@ -498,7 +543,15 @@ class ChatCompletionHandler {
 
             // Process any remaining data in the buffer on stream end
             aiResponse.body.on('end', () => {
+              // 修复中文编码截断问题：确保将解码器中剩余的字节也输出
+              const remainingString = decoder.end();
+              if (remainingString) {
+                sseLineBuffer += remainingString;
+                rawResponseDataThisTurn += remainingString;
+              }
+
               if (sseLineBuffer.trim()) {
+                // 注意：这里用 Buffer.from 是安全的，因为 sseLineBuffer 已经是完整的 JS 字符串了
                 const modifiedChunk = Buffer.from(sseLineBuffer, 'utf-8');
                 processChunk(modifiedChunk);
               }
@@ -1052,13 +1105,38 @@ class ChatCompletionHandler {
           const combinedToolResultsForAI = toolResults.flat(); // Flatten the array of content arrays
           await writeDebugLog('LogToolResultForAI-Stream', { role: 'user', content: combinedToolResultsForAI });
           
+          // V4.0: Create a unified tool payload with a hidden marker
+          // 修复 Bug: 如果结果包含图片，JSON.stringify 会导致 Base64 被视为几十万 token 的文本
+          const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
+          
+          // 1. 为 RAG 和日志生成轻量级文本 (去除 Base64)
+          const toolResultsTextForRAG = JSON.stringify(combinedToolResultsForAI, (key, value) => {
+              if ((key === 'url' || key === 'image_url') && typeof value === 'string' && value.startsWith('data:')) {
+                  return "[Base64 Image Data Omitted]";
+              }
+              return value;
+          });
+
+          // 2. 为 AI 生成真正的 Payload
+          let finalToolPayloadForAI;
+          if (hasImage) {
+              // 多模态模式：保持数组结构，将标记放入第一个文本块
+              finalToolPayloadForAI = [
+                  { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nHere are the tool results:` },
+                  ...combinedToolResultsForAI
+              ];
+          } else {
+              // 纯文本模式：保持原有的 JSON 字符串模式 (兼容性好)
+              finalToolPayloadForAI = `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
+          }
+
           // --- VCP RAG 刷新注入点 (流式) ---
-          const toolResultsText = JSON.stringify(combinedToolResultsForAI);
           const lastAiMessage = currentAIContentForLoop;
-          currentMessagesForLoop = await _refreshRagBlocksIfNeeded(currentMessagesForLoop, { lastAiMessage, toolResultsText }, pluginManager, DEBUG_MODE);
+          // 注意：传给 RAG 的必须是去除 Base64 的字符串，否则 RAG 也会卡死
+          currentMessagesForLoop = await _refreshRagBlocksIfNeeded(currentMessagesForLoop, { lastAiMessage, toolResultsText: toolResultsTextForRAG }, pluginManager, DEBUG_MODE);
           // --- 注入点结束 ---
 
-          currentMessagesForLoop.push({ role: 'user', content: combinedToolResultsForAI });
+          currentMessagesForLoop.push({ role: 'user', content: finalToolPayloadForAI });
           if (DEBUG_MODE)
             console.log(
               '[VCP Stream Loop] Combined tool results for next AI call (first 200):',
@@ -1067,7 +1145,22 @@ class ChatCompletionHandler {
 
           // --- Make next AI call (stream: true) ---
           if (!res.writableEnded) {
-            res.write('\n'); // 在下一个AI响应开始前，向客户端发送一个换行符
+            const sepChunk = {
+              id: `chatcmpl-VCP-separator-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: originalBody.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    content: '\n',  // 或者 '---\n'
+                  },
+                  finish_reason: null,
+                },
+              ],
+            };
+            res.write(`data: ${JSON.stringify(sepChunk)}\n\n`);
           }
           if (DEBUG_MODE) console.log('[VCP Stream Loop] Fetching next AI response.');
           const nextAiAPIResponse = await fetchWithRetry(
@@ -1567,13 +1660,38 @@ class ChatCompletionHandler {
             const combinedToolResultsForAI = toolResults.flat(); // Flatten the array of content arrays
             await writeDebugLog('LogToolResultForAI-NonStream', { role: 'user', content: combinedToolResultsForAI });
             
+            // V4.0: Create a unified tool payload with a hidden marker
+            // 修复 Bug: 如果结果包含图片，JSON.stringify 会导致 Base64 被视为几十万 token 的文本
+            const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
+            
+            // 1. 为 RAG 和日志生成轻量级文本 (去除 Base64)
+            const toolResultsTextForRAG = JSON.stringify(combinedToolResultsForAI, (key, value) => {
+                if ((key === 'url' || key === 'image_url') && typeof value === 'string' && value.startsWith('data:')) {
+                    return "[Base64 Image Data Omitted]";
+                }
+                return value;
+            });
+
+            // 2. 为 AI 生成真正的 Payload
+            let finalToolPayloadForAI;
+            if (hasImage) {
+                // 多模态模式：保持数组结构，将标记放入第一个文本块
+                finalToolPayloadForAI = [
+                    { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nHere are the tool results:` },
+                    ...combinedToolResultsForAI
+                ];
+            } else {
+                // 纯文本模式：保持原有的 JSON 字符串模式
+                finalToolPayloadForAI = `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
+            }
+
             // --- VCP RAG 刷新注入点 (非流式) ---
-            const toolResultsText = JSON.stringify(combinedToolResultsForAI);
             const lastAiMessage = currentAIContentForLoop;
-            currentMessagesForNonStreamLoop = await _refreshRagBlocksIfNeeded(currentMessagesForNonStreamLoop, { lastAiMessage, toolResultsText }, pluginManager, DEBUG_MODE);
+            // 注意：传给 RAG 的是去除 Base64 的字符串
+            currentMessagesForNonStreamLoop = await _refreshRagBlocksIfNeeded(currentMessagesForNonStreamLoop, { lastAiMessage, toolResultsText: toolResultsTextForRAG }, pluginManager, DEBUG_MODE);
             // --- 注入点结束 ---
 
-            currentMessagesForNonStreamLoop.push({ role: 'user', content: combinedToolResultsForAI });
+            currentMessagesForNonStreamLoop.push({ role: 'user', content: finalToolPayloadForAI });
 
             // Fetch the next AI response
             if (DEBUG_MODE) console.log('[Multi-Tool] Fetching next AI response after processing tools.');

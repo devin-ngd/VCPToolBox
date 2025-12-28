@@ -15,6 +15,9 @@ const dailyNoteRootPath = projectBasePath ? path.join(projectBasePath, 'dailynot
 // Config for 'create' command
 const CONFIGURED_EXTENSION = (process.env.DAILY_NOTE_EXTENSION || "txt").toLowerCase() === "md" ? "md" : "txt";
 
+// 忽略的文件夹列表
+const IGNORED_FOLDERS = ['MusicDiary'];
+
 
 // --- Debug Logging (to stderr) ---
 function debugLog(message, ...args) {
@@ -62,7 +65,8 @@ function fixTagFormat(tagLine) {
     let normalizedContent = tagContent
         .replace(/[\uff1a]/g, '')
         .replace(/[\uff0c]/g, ', ')
-        .replace(/[\u3001]/g, ', ');
+        .replace(/[\u3001]/g, ', ')
+        .replace(/[。.]+$/g, ''); // 🔧 修复：移除末尾的中文句号和英文句号
     normalizedContent = normalizedContent
         .replace(/,\s*/g, ', ')
         .replace(/,\s{2,}/g, ', ')
@@ -133,6 +137,11 @@ async function handleCreateCommand(args) {
             debugLog(`Sanitized folder name from "${folderName}" to "${sanitizedFolderName}"`);
         }
 
+        // 检查是否尝试写入被忽略的文件夹
+        if (IGNORED_FOLDERS.includes(sanitizedFolderName)) {
+            return { status: "error", error: `Cannot create diary in ignored folder: ${sanitizedFolderName}` };
+        }
+
         const datePart = dateString.replace(/[.\\\/\s-]/g, '-').replace(/-+/g, '-');
         const now = new Date();
         const hours = now.getHours().toString().padStart(2, '0');
@@ -179,50 +188,64 @@ async function handleUpdateCommand(args) {
     try {
         let modificationDone = false;
         let modifiedFilePath = null;
-        const directoriesToScan = [];
+        
+        // 构建搜索顺序：优先文件夹 + 其他所有文件夹
+        const priorityDirs = [];  // 优先搜索的文件夹
+        const otherDirs = [];     // 其他文件夹
+
+        // 获取所有子文件夹，过滤掉被忽略的文件夹
+        const allDirEntries = await fs.readdir(dailyNoteRootPath, { withFileTypes: true });
+        const allDirs = allDirEntries.filter(d => d.isDirectory() && !IGNORED_FOLDERS.includes(d.name));
+        debugLog(`Filtered out ignored folders: ${IGNORED_FOLDERS.join(', ')}. Remaining directories: ${allDirs.map(d => d.name).join(', ')}`);
 
         if (maid) {
             const maidRegex = /^\[(.+?)\]/;
             const match = maid.match(maidRegex);
 
             if (match) {
-                const subfolder = match[1];
-                const scanPath = path.join(dailyNoteRootPath, subfolder);
-                debugLog(`Maid specifies a folder: '${subfolder}'. Scanning directory: ${scanPath}`);
-                try {
-                    const stats = await fs.stat(scanPath);
-                    if (stats.isDirectory()) {
-                        directoriesToScan.push({ name: subfolder, path: scanPath });
+                // 格式: [小克的知识]小克 -> 优先在 "小克的知识" 文件夹找
+                const priorityFolder = match[1];
+                debugLog(`Maid specifies priority folder: '${priorityFolder}'`);
+                
+                for (const dirEntry of allDirs) {
+                    const dirPath = path.join(dailyNoteRootPath, dirEntry.name);
+                    if (dirEntry.name === priorityFolder) {
+                        priorityDirs.push({ name: dirEntry.name, path: dirPath });
                     } else {
-                        return { status: "error", error: `Specified diary path is not a directory: ${scanPath}` };
+                        otherDirs.push({ name: dirEntry.name, path: dirPath });
                     }
-                } catch (e) {
-                    if (e.code === 'ENOENT') {
-                        return { status: "error", error: `Diary subfolder not found: ${scanPath}` };
-                    }
-                    throw e;
+                }
+                
+                if (priorityDirs.length === 0) {
+                    debugLog(`Priority folder '${priorityFolder}' not found, will search all folders.`);
                 }
             } else {
-                debugLog(`Maid specified: '${maid}'. Targeting directories starting with this name in root.`);
-                const allDirs = await fs.readdir(dailyNoteRootPath, { withFileTypes: true });
+                // 格式: 小克 -> 优先在以 "小克" 开头的文件夹找
+                debugLog(`Maid specified: '${maid}'. Prioritizing directories starting with this name.`);
+                
                 for (const dirEntry of allDirs) {
-                    if (dirEntry.isDirectory() && dirEntry.name.startsWith(maid)) {
-                        directoriesToScan.push({ name: dirEntry.name, path: path.join(dailyNoteRootPath, dirEntry.name) });
+                    const dirPath = path.join(dailyNoteRootPath, dirEntry.name);
+                    if (dirEntry.name.startsWith(maid)) {
+                        priorityDirs.push({ name: dirEntry.name, path: dirPath });
+                    } else {
+                        otherDirs.push({ name: dirEntry.name, path: dirPath });
                     }
                 }
             }
-
-            if (directoriesToScan.length === 0) {
-                return { status: "error", error: `No diary folders found for maid '${maid}'.` };
-            }
         } else {
+            // 没有指定 maid，搜索所有文件夹
             debugLog("No maid specified. Scanning all directories.");
-            const characterDirs = await fs.readdir(dailyNoteRootPath, { withFileTypes: true });
-            for (const dirEntry of characterDirs) {
-                if (dirEntry.isDirectory()) {
-                    directoriesToScan.push({ name: dirEntry.name, path: path.join(dailyNoteRootPath, dirEntry.name) });
-                }
+            for (const dirEntry of allDirs) {
+                otherDirs.push({ name: dirEntry.name, path: path.join(dailyNoteRootPath, dirEntry.name) });
             }
+        }
+
+        // 合并搜索顺序：优先文件夹在前
+        const directoriesToScan = [...priorityDirs, ...otherDirs];
+        debugLog(`Search order: ${directoriesToScan.map(d => d.name).join(' -> ')}`);
+
+        if (directoriesToScan.length === 0) {
+            return { status: "error", error: `No diary folders found in ${dailyNoteRootPath}` };
         }
 
         for (const dir of directoriesToScan) {
