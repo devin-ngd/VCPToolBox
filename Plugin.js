@@ -525,13 +525,35 @@ class PluginManager {
     async loadPlugins() {
         console.log('[PluginManager] Starting plugin discovery...');
         // 1. 清理现有插件状态
-        const localPlugins = new Map();
+        // 1.1 识别并关闭本地插件，保留分布式插件
+        const distributedPlugins = new Map();
+        const localModulesToShutdown = new Set();
+
         for (const [name, manifest] of this.plugins.entries()) {
-            if (!manifest.isDistributed) {
-                localPlugins.set(name, manifest);
+            if (manifest.isDistributed) {
+                distributedPlugins.set(name, manifest);
+            } else {
+                // 收集本地插件模块以进行清理
+                const preprocessor = this.messagePreprocessors.get(name);
+                if (preprocessor) localModulesToShutdown.add(preprocessor);
+
+                const service = this.serviceModules.get(name)?.module;
+                if (service) localModulesToShutdown.add(service);
             }
         }
-        this.plugins = localPlugins;
+
+        // 执行清理：在重新加载前关闭旧的本地插件实例，释放资源
+        for (const module of localModulesToShutdown) {
+            if (typeof module.shutdown === 'function') {
+                try {
+                    module.shutdown();
+                } catch (e) {
+                    console.error(`[PluginManager] Error during hot-reload shutdown of a plugin:`, e.message);
+                }
+            }
+        }
+
+        this.plugins = distributedPlugins; // 仅保留分布式插件，本地插件将被重新发现
         this.messagePreprocessors.clear();
         this.staticPlaceholderValues.clear();
         this.serviceModules.clear();
@@ -808,11 +830,13 @@ class PluginManager {
                // --- 混合服务插件直接调用逻辑 ---
                if (this.debugMode) console.log(`[PluginManager] Processing direct tool call for hybrid service: ${toolName}`);
                const serviceModule = this.getServiceModule(toolName);
-               if (serviceModule && typeof serviceModule.processToolCall === 'function') {
-                   resultFromPlugin = await serviceModule.processToolCall(pluginSpecificArgs);
-               } else {
+               if (!serviceModule) {
+                   throw new Error(`[PluginManager] Hybrid service plugin "${toolName}" module not found. It may have failed to load or initialize during hot-reload.`);
+               }
+               if (typeof serviceModule.processToolCall !== 'function') {
                    throw new Error(`[PluginManager] Hybrid service plugin "${toolName}" does not have a processToolCall function.`);
                }
+               resultFromPlugin = await serviceModule.processToolCall(pluginSpecificArgs);
             } else {
                 // --- 本地插件调用逻辑 (现有逻辑) ---
                 if (!((plugin.pluginType === 'synchronous' || plugin.pluginType === 'asynchronous') && plugin.communication?.protocol === 'stdio')) {

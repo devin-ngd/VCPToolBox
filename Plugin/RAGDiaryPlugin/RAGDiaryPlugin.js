@@ -2452,7 +2452,7 @@ class RAGDiaryPlugin {
      * ✅ 定期清理过期缓存
      */
     _startCacheCleanupTask() {
-        setInterval(() => {
+        this.cacheCleanupInterval = setInterval(() => {
             const now = Date.now();
             let expiredCount = 0;
 
@@ -2525,7 +2525,7 @@ class RAGDiaryPlugin {
      * ✅ 定期清理过期向量缓存
      */
     _startEmbeddingCacheCleanupTask() {
-        setInterval(() => {
+        this.embeddingCacheCleanupInterval = setInterval(() => {
             const now = Date.now();
             let expiredCount = 0;
 
@@ -2576,7 +2576,7 @@ class RAGDiaryPlugin {
      * ✅ 定期清理过期AIMemo缓存
      */
     _startAiMemoCacheCleanupTask() {
-        setInterval(() => {
+        this.aiMemoCacheCleanupInterval = setInterval(() => {
             const now = Date.now();
             let expiredCount = 0;
 
@@ -2591,6 +2591,25 @@ class RAGDiaryPlugin {
                 console.log(`[RAGDiaryPlugin] 清理了 ${expiredCount} 条过期AIMemo缓存`);
             }
         }, this.aiMemoCacheTTL);
+    }
+
+    /**
+     * ✅ 关闭插件，清理定时器
+     */
+    shutdown() {
+        if (this.cacheCleanupInterval) {
+            clearInterval(this.cacheCleanupInterval);
+            this.cacheCleanupInterval = null;
+        }
+        if (this.embeddingCacheCleanupInterval) {
+            clearInterval(this.embeddingCacheCleanupInterval);
+            this.embeddingCacheCleanupInterval = null;
+        }
+        if (this.aiMemoCacheCleanupInterval) {
+            clearInterval(this.aiMemoCacheCleanupInterval);
+            this.aiMemoCacheCleanupInterval = null;
+        }
+        console.log(`[RAGDiaryPlugin] 插件已关闭，定时器已清理`);
     }
 }
 

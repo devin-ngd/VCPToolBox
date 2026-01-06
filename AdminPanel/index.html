@@ -301,12 +301,44 @@
    </style>
  </head>
  <body>
+   <div class="solar-system-bg" aria-hidden="true">
+       <div class="stars"></div>
+       <div class="stars2"></div>
+       <div class="stars3"></div>
+       <div class="sun"></div>
+       <div class="orbit orbit-mercury"><div class="planet planet-mercury"></div></div>
+       <div class="orbit orbit-venus"><div class="planet planet-venus"></div></div>
+       <div class="orbit orbit-earth"><div class="planet planet-earth"></div></div>
+       <div class="orbit orbit-mars"><div class="planet planet-mars"></div></div>
+       <div class="orbit orbit-jupiter"><div class="planet planet-jupiter"></div></div>
+       <div class="orbit orbit-saturn"><div class="planet planet-saturn"></div></div>
+       <div class="orbit orbit-uranus"><div class="planet planet-uranus"></div></div>
+       <div class="orbit orbit-neptune"><div class="planet planet-neptune"></div></div>
+       <div class="shooting-stars">
+           <div class="shooting-star"></div>
+           <div class="shooting-star"></div>
+           <div class="shooting-star"></div>
+       </div>
+       <button id="exit-immersive-button" class="exit-immersive-button">退出沉浸模式</button>
+   </div>
     <header class="top-bar">
         <div class="top-bar-content">
-            <span class="server-title">VCPToolBox</span>
+            <button id="mobile-menu-toggle" class="mobile-menu-toggle">
+                <span class="material-symbols-outlined">menu</span>
+            </button>
+            <div class="brand">
+                <span class="material-symbols-outlined brand-icon">terminal</span>
+                <span class="server-title">VCPToolBox</span>
+            </div>
             <div class="header-actions">
-                <button id="restart-server-button" class="restart-button">重启服务器</button>
-                <button id="theme-toggle-button" class="theme-button">切换主题</button>
+                <button id="restart-server-button" class="restart-button">
+                    <span class="material-symbols-outlined">restart_alt</span>
+                    重启服务器
+                </button>
+                <button id="theme-toggle-button" class="theme-button">
+                    <span class="material-symbols-outlined">contrast</span>
+                    切换主题
+                </button>
             </div>
         </div>
     </header>
@@ -333,6 +365,7 @@
                     <li><a href="#" data-target="tool-list-editor"><span class="material-symbols-outlined">construction</span>工具列表配置编辑器</a></li>
                     <li><a href="#" data-target="preprocessor-order-manager"><span class="material-symbols-outlined">sort</span>预处理器顺序管理</a></li>
                     <li><a href="#" data-target="thinking-chains-editor"><span class="material-symbols-outlined">psychology</span>思维链编辑器</a></li>
+                    <li><a href="#" data-target="schedule-manager"><span class="material-symbols-outlined">calendar_month</span>日程管理</a></li>
                     <li><a href="#" data-target="server-log-viewer"><span class="material-symbols-outlined">terminal</span>服务器日志</a></li>
                     <li class="nav-category" id="plugins-category">———— 插 件 管 理 ————</li>
                     <!-- 插件列表将动态生成在这里 -->
@@ -346,7 +379,7 @@
                 <h2>仪表盘</h2>
                 <div class="vcp-animation-container">
                     <div class="vcp-logo-container">
-                        <img src="VCPLogo2.png" alt="VCP Logo" class="vcp-logo">
+                        <img src="VCPLogo2.png" alt="VCP Logo" class="vcp-logo" id="vcp-logo-main">
                     </div>
                     <canvas id="vcp-animation-canvas"></canvas>
                 </div>
@@ -371,6 +404,7 @@
                                 <svg width="120" height="120" viewBox="0 0 120 120">
                                     <circle class="progress-bg" cx="60" cy="60" r="54"></circle>
                                     <circle class="progress-bar" cx="60" cy="60" r="54"></circle>
+                                    <circle class="progress-bar-secondary" cx="60" cy="60" r="54"></circle>
                                 </svg>
                                 <span class="progress-text" id="mem-usage-text">0%</span>
                             </div>
@@ -391,6 +425,45 @@
                         <h3>Node.js 进程信息</h3>
                         <div class="status-card-content" id="node-info-list">
                            <p>加载中...</p>
+                        </div>
+                    </div>
+                    <div class="status-card weather-card">
+                        <h3>天气预报</h3>
+                        <div class="weather-container">
+                            <div class="weather-current">
+                                <div class="current-main">
+                                    <span id="weather-icon" class="material-symbols-outlined weather-icon-large">--</span>
+                                    <div class="current-temp-box">
+                                        <div class="temp-row">
+                                            <span id="weather-temp">--</span><span class="unit">°C</span>
+                                        </div>
+                                        <div id="weather-text">加载中...</div>
+                                    </div>
+                                </div>
+                                <div class="current-details">
+                                    <div class="detail-item">
+                                        <span class="material-symbols-outlined">humidity_percentage</span>
+                                        <span id="weather-humidity">--%</span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span class="material-symbols-outlined">air</span>
+                                        <span id="weather-wind">--</span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span class="material-symbols-outlined">compress</span>
+                                        <span id="weather-pressure">-- hPa</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="weather-forecast" id="weather-forecast">
+                                <!-- 预报内容将动态加载 -->
+                            </div>
+                        </div>
+                    </div>
+                    <div class="status-card calendar-card">
+                        <h3>日程概览</h3>
+                        <div id="dashboard-calendar-widget" class="calendar-widget">
+                            <!-- 日历挂件将动态加载到这里 -->
                         </div>
                     </div>
                 </div>
@@ -473,7 +546,7 @@
 
             <section id="image-cache-editor-section" class="config-section">
                 <h2>图像缓存编辑器</h2>
-                <iframe src="image_cache_editor.html" style="width: 100%; height: 80vh; border: none;"></iframe>
+                <iframe data-src="image_cache_editor.html" style="width: 100%; height: 80vh; border: none;"></iframe>
             </section>
 
             <section id="semantic-groups-editor-section" class="config-section">
@@ -491,7 +564,7 @@
 
             <section id="vcptavern-editor-section" class="config-section">
                 <h2>VCPTarven预设编辑</h2>
-                <iframe src="vcptavern_editor.html" style="width: 100%; height: 80vh; border: none;"></iframe>
+                <iframe data-src="vcptavern_editor.html" style="width: 100%; height: 80vh; border: none;"></iframe>
             </section>
 
             <section id="agent-files-editor-section" class="config-section">
@@ -605,18 +678,21 @@
 
             <!-- Section: Tool List Editor -->
             <section id="tool-list-editor-section" class="config-section">
-                <iframe src="tool_list_editor.html" style="width: 100%; height: 100vh; border: none;"></iframe>
+                <iframe data-src="tool_list_editor.html" style="width: 100%; height: 100vh; border: none;"></iframe>
             </section>
 
             <section id="server-log-viewer-section" class="config-section">
                 <h2>服务器实时日志</h2>
-                <div class="server-log-controls">
-                    <input type="search" id="server-log-filter" placeholder="输入关键词筛选日志...">
-                    <button id="copy-server-log-button">复制日志</button>
-                    <span id="server-log-path-display"></span>
-                    <span id="server-log-status" class="status-message"></span>
+                <div class="log-viewer-container">
+                    <div class="log-header">
+                        <span id="server-log-path-display">当前日志文件: 加载中...</span>
+                        <input type="text" id="server-log-filter" placeholder="🔍 过滤日志内容...">
+                        <span id="server-log-line-count">0 行</span>
+                        <span id="server-log-status" class="status-message info">就绪</span>
+                        <button id="copy-server-log-button" class="btn-secondary">📋 复制</button>
+                    </div>
+                    <pre id="server-log-content" class="log-content-area"></pre>
                 </div>
-                <pre id="server-log-content" class="log-content-area"></pre>
             </section>
 
            <!-- Section: Preprocessor Order Manager -->
@@ -658,6 +734,52 @@
                </div>
                <div id="forum-posts-container" class="forum-posts-container">
                    <!-- Forum posts will be loaded here -->
+               </div>
+           </section>
+
+           <!-- Section: Schedule Manager -->
+           <section id="schedule-manager-section" class="config-section">
+               <h2>日程管理</h2>
+               <div class="schedule-manager-container">
+                   <div class="schedule-left-panel">
+                       <div class="calendar-container card">
+                           <div class="calendar-header">
+                               <button id="prev-month" class="icon-btn"><span class="material-symbols-outlined">chevron_left</span></button>
+                               <h3 id="current-month-year">2023年 10月</h3>
+                               <button id="next-month" class="icon-btn"><span class="material-symbols-outlined">chevron_right</span></button>
+                           </div>
+                           <div id="calendar-grid" class="calendar-grid">
+                               <!-- 日历格子 -->
+                           </div>
+                       </div>
+                       <div class="add-schedule-form card">
+                           <h3>添加新日程</h3>
+                           <div class="form-group">
+                               <label for="new-schedule-time">时间</label>
+                               <input type="datetime-local" id="new-schedule-time">
+                           </div>
+                           <div class="form-group">
+                               <label for="new-schedule-content">内容</label>
+                               <textarea id="new-schedule-content" rows="3" placeholder="输入日程内容..."></textarea>
+                           </div>
+                           <button id="add-schedule-btn" class="primary-btn">添加日程</button>
+                       </div>
+                   </div>
+                   <div class="schedule-right-panel">
+                       <div class="schedule-list-container card">
+                           <div class="list-header">
+                               <h3>日程列表</h3>
+                               <div class="list-filters">
+                                   <button id="filter-all" class="filter-btn active">全部</button>
+                                   <button id="filter-upcoming" class="filter-btn">即将到来</button>
+                               </div>
+                           </div>
+                           <div id="schedule-list" class="schedule-list">
+                               <!-- 日程条目 -->
+                               <p class="empty-msg">加载中...</p>
+                           </div>
+                       </div>
+                   </div>
                </div>
            </section>
         </main>
@@ -801,6 +923,37 @@
                 animate();
             }
         });
+
+        // 移动端菜单切换逻辑
+        const mobileMenuToggle = document.getElementById('mobile-menu-toggle');
+        const sidebar = document.querySelector('.sidebar');
+        const contentOverlay = document.createElement('div');
+        contentOverlay.className = 'sidebar-overlay';
+        document.body.appendChild(contentOverlay);
+
+        if (mobileMenuToggle && sidebar) {
+            mobileMenuToggle.addEventListener('click', () => {
+                sidebar.classList.toggle('mobile-active');
+                contentOverlay.classList.toggle('active');
+            });
+
+            contentOverlay.addEventListener('click', () => {
+                sidebar.classList.remove('mobile-active');
+                contentOverlay.classList.remove('active');
+            });
+
+            // 点击导航链接后自动关闭侧边栏
+            const navLinks = sidebar.querySelectorAll('nav a');
+            navLinks.forEach(link => {
+                link.addEventListener('click', () => {
+                    if (window.innerWidth <= 768) {
+                        sidebar.classList.remove('mobile-active');
+                        contentOverlay.classList.remove('active');
+                    }
+                });
+            });
+        }
+
         // 主题切换逻辑保持不变
         const themeToggleButton = document.getElementById('theme-toggle-button');
         const currentTheme = localStorage.getItem('theme') ? localStorage.getItem('theme') : null;

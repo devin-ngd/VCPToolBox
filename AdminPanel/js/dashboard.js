@@ -1,5 +1,6 @@
 // AdminPanel/js/dashboard.js
 import { apiFetch } from './utils.js';
+import { initializeCalendarWidget } from './schedule-manager.js';
 
 const MONITOR_API_BASE_URL = '/admin_api/system-monitor';
 const API_BASE_URL = '/admin_api';
@@ -7,6 +8,9 @@ const API_BASE_URL = '/admin_api';
 let monitorIntervalId = null;
 let activityDataPoints = new Array(60).fill(0);
 let lastLogCheckTime = null;
+
+let logoClickCount = 0;
+let logoClickTimer = null;
 
 /**
  * 初始化仪表盘，设置定时器并加载初始数据。
@@ -17,6 +21,8 @@ export function initializeDashboard() {
         clearInterval(monitorIntervalId);
     }
     updateDashboardData();
+    updateWeatherData();
+    initializeCalendarWidget();
     
     updateActivityChart().then(() => {
         drawActivityChart();
@@ -24,10 +30,62 @@ export function initializeDashboard() {
 
     monitorIntervalId = setInterval(() => {
         updateDashboardData();
+        updateWeatherData();
+        initializeCalendarWidget();
         updateActivityChart().then(() => {
              drawActivityChart();
         });
     }, 5000);
+
+    // 彩蛋逻辑：点击5次logo进入沉浸模式
+    const logo = document.getElementById('vcp-logo-main');
+    if (logo && !logo.dataset.easterEggInitialized) {
+        logo.addEventListener('click', () => {
+            logoClickCount++;
+            clearTimeout(logoClickTimer);
+            if (logoClickCount >= 5) {
+                enterImmersiveMode();
+                logoClickCount = 0;
+            } else {
+                logoClickTimer = setTimeout(() => {
+                    logoClickCount = 0;
+                }, 2000);
+            }
+        });
+        logo.dataset.easterEggInitialized = 'true';
+    }
+
+    const exitBtn = document.getElementById('exit-immersive-button');
+    if (exitBtn && !exitBtn.dataset.easterEggInitialized) {
+        exitBtn.addEventListener('click', exitImmersiveMode);
+        exitBtn.dataset.easterEggInitialized = 'true';
+    }
+}
+
+/**
+ * 进入太阳系沉浸观景模式
+ */
+function enterImmersiveMode() {
+    const bg = document.querySelector('.solar-system-bg');
+    if (bg) {
+        bg.classList.add('immersive-mode');
+        document.documentElement.classList.add('ui-hidden-immersive');
+        document.body.style.overflow = 'hidden';
+        console.log('Entering immersive solar system mode...');
+    }
+}
+
+/**
+ * 退出沉浸模式
+ */
+function exitImmersiveMode() {
+    const bg = document.querySelector('.solar-system-bg');
+    if (bg) {
+        bg.classList.remove('immersive-mode');
+        document.documentElement.classList.remove('ui-hidden-immersive');
+        document.body.style.overflow = '';
+        console.log('Exiting immersive mode.');
+    }
 }
 
 /**
@@ -78,8 +136,10 @@ async function updateDashboardData() {
         if (memProgress && memUsageText && memInfoText) {
             const memUsed = resources.system.memory.used;
             const memTotal = resources.system.memory.total;
+            const vcpMemUsed = resources.system.nodeProcess.memory.rss;
             const memUsage = memTotal > 0 ? ((memUsed / memTotal) * 100).toFixed(1) : 0;
-            updateProgressCircle(memProgress, memUsageText, memUsage);
+            const vcpMemUsage = memTotal > 0 ? ((vcpMemUsed / memTotal) * 100).toFixed(1) : 0;
+            updateProgressCircle(memProgress, memUsageText, memUsage, vcpMemUsage);
             memInfoText.innerHTML = `已用: ${(memUsed / 1024 / 1024 / 1024).toFixed(2)} GB <br> 总共: ${(memTotal / 1024 / 1024 / 1024).toFixed(2)} GB`;
         }
         
@@ -122,12 +182,112 @@ async function updateDashboardData() {
 }
 
 /**
+ * 更新天气预报数据。
+ */
+async function updateWeatherData() {
+    const weatherIcon = document.getElementById('weather-icon');
+    const weatherTemp = document.getElementById('weather-temp');
+    const weatherText = document.getElementById('weather-text');
+    const weatherHumidity = document.getElementById('weather-humidity');
+    const weatherWind = document.getElementById('weather-wind');
+    const weatherPressure = document.getElementById('weather-pressure');
+    const weatherForecast = document.getElementById('weather-forecast');
+
+    if (!weatherIcon) return;
+
+    try {
+        const data = await apiFetch(`${API_BASE_URL}/weather`, {}, false);
+        
+        // 映射天气图标 (使用 Material Symbols)
+        const iconMap = {
+            '100': 'sunny',
+            '101': 'cloudy',
+            '102': 'cloudy',
+            '103': 'partly_cloudy_day',
+            '104': 'cloud',
+            '150': 'clear_night',
+            '151': 'nights_stay',
+            '152': 'nights_stay',
+            '153': 'nights_stay',
+            '154': 'cloud',
+            '300': 'rainy',
+            '301': 'rainy',
+            '302': 'rainy_heavy',
+            '303': 'rainy_heavy',
+            '304': 'rainy_heavy',
+            '305': 'rainy',
+            '306': 'rainy',
+            '307': 'rainy_heavy',
+            '308': 'rainy_heavy',
+            '309': 'rainy',
+            '310': 'rainy_heavy',
+            '311': 'rainy_heavy',
+            '312': 'rainy_heavy',
+            '313': 'rainy_heavy',
+            '314': 'rainy',
+            '315': 'rainy_heavy',
+            '316': 'rainy_heavy',
+            '317': 'rainy_heavy',
+            '318': 'rainy_heavy',
+            '350': 'rainy',
+            '351': 'rainy_heavy',
+            '399': 'rainy',
+            'default': 'wb_sunny'
+        };
+
+        if (data && data.hourly && data.hourly.length > 0) {
+            // 寻找最接近当前时间的整点预报
+            const now = new Date();
+            let current = data.hourly[0];
+            let minDiff = Infinity;
+
+            for (const hourData of data.hourly) {
+                const forecastTime = new Date(hourData.fxTime);
+                const diff = Math.abs(now - forecastTime);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    current = hourData;
+                }
+            }
+
+            weatherIcon.textContent = iconMap[current.icon] || iconMap['default'];
+            weatherTemp.textContent = current.temp;
+            weatherText.textContent = current.text;
+            weatherHumidity.textContent = `${current.humidity}%`;
+            weatherWind.textContent = `${current.windDir} ${current.windScale}级`;
+            weatherPressure.textContent = `${current.pressure} hPa`;
+        }
+
+        if (data && data.daily && data.daily.length > 0 && weatherForecast) {
+            weatherForecast.innerHTML = '';
+            // 显示未来 4 天的预报 (跳过今天)
+            data.daily.slice(1, 5).forEach(day => {
+                const date = new Date(day.fxDate);
+                const dayName = date.toLocaleDateString('zh-CN', { weekday: 'short' });
+                
+                const forecastItem = document.createElement('div');
+                forecastItem.className = 'forecast-item';
+                forecastItem.innerHTML = `
+                    <span class="forecast-date">${dayName}</span>
+                    <span class="material-symbols-outlined forecast-icon">${iconMap[day.iconDay] || iconMap['default']}</span>
+                    <span class="forecast-temp">${day.tempMin}°/${day.tempMax}°</span>
+                `;
+                weatherForecast.appendChild(forecastItem);
+            });
+        }
+    } catch (error) {
+        console.error('Failed to update weather data:', error);
+        if (weatherText) weatherText.textContent = '加载失败';
+    }
+}
+
+/**
  * 更新圆形进度条。
  * @param {HTMLElement} circleElement - SVG 元素
  * @param {HTMLElement} textElement - 显示百分比的文本元素
  * @param {number} percentage - 百分比
  */
-function updateProgressCircle(circleElement, textElement, percentage) {
+function updateProgressCircle(circleElement, textElement, percentage, secondaryPercentage = null) {
     const radius = 54;
     const circumference = 2 * Math.PI * radius;
     const offset = circumference - (percentage / 100) * circumference;
@@ -136,6 +296,15 @@ function updateProgressCircle(circleElement, textElement, percentage) {
     if (progressBar) {
         progressBar.style.strokeDashoffset = offset;
     }
+
+    if (secondaryPercentage !== null) {
+        const secondaryProgressBar = circleElement.querySelector('.progress-bar-secondary');
+        if (secondaryProgressBar) {
+            const secondaryOffset = circumference - (secondaryPercentage / 100) * circumference;
+            secondaryProgressBar.style.strokeDashoffset = secondaryOffset;
+        }
+    }
+
     if (textElement) {
         textElement.textContent = `${percentage}%`;
     }
