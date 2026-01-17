@@ -11,6 +11,12 @@ export interface SearchResult {
   id: number
   score: number
 }
+export interface SvdResult {
+  u: Array<number>
+  s: Array<number>
+  k: number
+  dim: number
+}
 /** 统计信息 */
 export interface VexusStats {
   totalVectors: number
@@ -41,4 +47,11 @@ export declare class VexusIndex {
   stats(): VexusStats
   /** 从 SQLite 数据库恢复索引 (异步版本，不阻塞主线程) */
   recoverFromSqlite(dbPath: string, tableType: string, filterDiaryName?: string | undefined | null): Promise<unknown>
+  /**
+   * 高性能 SVD 分解 (用于 EPA 基底构建)
+   * flattened_vectors: n * dim 的扁平化向量数组
+   * n: 向量数量
+   * max_k: 最大保留的主成分数量
+   */
+  computeSvd(flattenedVectors: Buffer, n: number, maxK: number): SvdResult
 }

@@ -1590,6 +1590,17 @@ button[type="submit"]:hover {
     margin: 0;
     will-change: scroll-position;
     contain: content;
+    display: flex;
+    flex-direction: column;
+}
+
+#server-log-content > div {
+    animation: logFadeIn 0.3s ease-out forwards;
+}
+
+@keyframes logFadeIn {
+    from { opacity: 0; transform: translateY(-5px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 html[data-theme='light'] #server-log-content {
@@ -2265,6 +2276,26 @@ html[data-theme='light'] .delete-theme-btn {
     align-items: center;
     justify-content: space-between;
     /* Inherits from .draggable-list li */
+}
+
+.chain-item.dragging {
+    opacity: 0.5;
+    cursor: grabbing;
+}
+
+.dragging-placeholder {
+    opacity: 0.5;
+    background-color: var(--accent-bg);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 4px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.dragging-placeholder .cluster-name {
+    font-weight: 500;
 }
 
 .remove-cluster-btn {
@@ -3023,5 +3054,18 @@ html[data-theme='light'] .delete-theme-btn {
     .aa-agents-header button#aa-add-custom-agent-button {
         order: 5;
         width: 100%;
+    }
+
+    /* 高级变量编辑器输入框移动端高度调整 */
+    #tvs-files-editor-section.active-section {
+        height: calc(100vh - 120px) !important; /* 减去顶部栏和一些边距 */
+        display: flex;
+        flex-direction: column;
+    }
+
+    #tvs-file-content-editor {
+        flex-grow: 1 !important;
+        height: auto !important;
+        min-height: 60vh !important;
     }
 }

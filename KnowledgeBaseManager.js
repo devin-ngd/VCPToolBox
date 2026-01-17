@@ -9,6 +9,8 @@ const Database = require('better-sqlite3');
 const chokidar = require('chokidar');
 const { chunkText } = require('./TextChunker'); 
 const { getEmbeddingsBatch } = require('./EmbeddingUtils');
+const EPAModule = require('./EPAModule');
+const ResidualPyramid = require('./ResidualPyramid');
 
 // 尝试加载 Rust Vexus 引擎
 let VexusIndex = null;
@@ -24,8 +26,8 @@ try {
 class KnowledgeBaseManager {
     constructor(config = {}) {
         this.config = {
-            rootPath: config.rootPath || path.join(__dirname, 'dailynote'),
-            storePath: config.storePath || path.join(__dirname, 'VectorStore'),
+            rootPath: config.rootPath || process.env.KNOWLEDGEBASE_ROOT_PATH || path.join(__dirname, 'dailynote'),
+            storePath: config.storePath || process.env.KNOWLEDGEBASE_STORE_PATH || path.join(__dirname, 'VectorStore'),
             apiKey: process.env.API_Key,
             apiUrl: process.env.API_URL,
             model: process.env.WhitelistEmbeddingModel || 'google/gemini-embedding-001',
@@ -59,6 +61,8 @@ class KnowledgeBaseManager {
         this.isProcessing = false;
         this.saveTimers = new Map();
         this.tagCooccurrenceMatrix = null; // 优化1：Tag共现矩阵
+        this.epa = null;
+        this.residualPyramid = null;
     }
 
     async initialize() {
@@ -97,6 +101,12 @@ class KnowledgeBaseManager {
         
         // 优化1：启动时构建共现矩阵
         this._buildCooccurrenceMatrix();
+
+        // 初始化 EPA 和残差金字塔模块
+        this.epa = new EPAModule(this.db, { dimension: this.config.dimension });
+        await this.epa.initialize();
+        
+        this.residualPyramid = new ResidualPyramid(this.tagIndex, this.db, { dimension: this.config.dimension });
 
         this._startWatcher();
         this.initialized = true;
@@ -220,6 +230,7 @@ class KnowledgeBaseManager {
             let queryVec = null;
             let k = 5;
             let tagBoost = 0;
+            let useV3 = true; // 默认启用 V3 增强
 
             if (typeof arg1 === 'string' && Array.isArray(arg2)) {
                 diaryName = arg1;
@@ -238,9 +249,9 @@ class KnowledgeBaseManager {
             if (!queryVec) return [];
 
             if (diaryName) {
-                return await this._searchSpecificIndex(diaryName, queryVec, k, tagBoost);
+                return await this._searchSpecificIndex(diaryName, queryVec, k, tagBoost, useV3);
             } else {
-                return await this._searchAllIndices(queryVec, k, tagBoost);
+                return await this._searchAllIndices(queryVec, k, tagBoost, useV3);
             }
         } catch (e) {
             console.error('[KnowledgeBase] Search Error:', e);
@@ -248,7 +259,7 @@ class KnowledgeBaseManager {
         }
     }
 
-    async _searchSpecificIndex(diaryName, vector, k, tagBoost) {
+    async _searchSpecificIndex(diaryName, vector, k, tagBoost, useV3 = true) {
         const idx = await this._getOrLoadDiaryIndex(diaryName);
         
         // 如果索引为空，直接返回
@@ -266,7 +277,9 @@ class KnowledgeBaseManager {
             let searchVecFloat;
             if (tagBoost > 0) {
                 // 🌟 TagMemo 逻辑回归：应用 Tag 增强
-                const boostResult = this._applyTagBoost(new Float32Array(vector), tagBoost);
+                const boostResult = useV3
+                    ? this._applyTagBoostV3(new Float32Array(vector), tagBoost)
+                    : this._applyTagBoost(new Float32Array(vector), tagBoost);
                 searchVecFloat = boostResult.vector;
                 tagInfo = boostResult.info;
             } else {
@@ -319,13 +332,15 @@ class KnowledgeBaseManager {
         }).filter(Boolean);
     }
 
-    async _searchAllIndices(vector, k, tagBoost) {
+    async _searchAllIndices(vector, k, tagBoost, useV3 = true) {
         // 优化2：使用 Promise.all 并行搜索
         let searchVecFloat;
         let tagInfo = null;
 
         if (tagBoost > 0) {
-            const boostResult = this._applyTagBoost(new Float32Array(vector), tagBoost);
+            const boostResult = useV3
+                ? this._applyTagBoostV3(new Float32Array(vector), tagBoost)
+                : this._applyTagBoost(new Float32Array(vector), tagBoost);
             searchVecFloat = boostResult.vector;
             tagInfo = boostResult.info;
         } else {
@@ -554,6 +569,104 @@ class KnowledgeBaseManager {
     }
 
     /**
+     * 🌟 TagMemo V3 + EPA + Residual Pyramid 增强版
+     */
+    _applyTagBoostV3(vector, baseTagBoost) {
+        const debug = true;
+        const originalFloat32 = vector instanceof Float32Array ? vector : new Float32Array(vector);
+        const dim = originalFloat32.length;
+
+        try {
+            // [1] EPA 分析 (逻辑深度与共振)
+            const epaResult = this.epa.project(originalFloat32);
+            const resonance = this.epa.detectCrossDomainResonance(originalFloat32);
+
+            // [2] 残差金字塔分析 (新颖度与覆盖率)
+            const pyramid = this.residualPyramid.analyze(originalFloat32);
+            const features = pyramid.features;
+
+            // [3] 动态调整策略
+            const logicDepth = epaResult.logicDepth;        // 0~1, 高=逻辑聚焦
+            const entropyPenalty = epaResult.entropy;       // 0~1, 高=信息散乱
+            const resonanceBoost = Math.log(1 + resonance.resonance);
+            
+            // 核心公式：结合 EPA 和残差特征
+            const activationMultiplier = 0.5 + features.tagMemoActivation * 1.5;
+            const dynamicBoostFactor = (logicDepth * (1 + resonanceBoost) / (1 + entropyPenalty * 0.5)) * activationMultiplier;
+            
+            const effectiveTagBoost = baseTagBoost * Math.min(2.0, Math.max(0.3, dynamicBoostFactor));
+            
+            if (debug) {
+                console.log(`[TagMemo-V3] Depth=${logicDepth.toFixed(3)}, Entropy=${entropyPenalty.toFixed(3)}, Resonance=${resonance.resonance.toFixed(3)}`);
+                console.log(`[TagMemo-V3] Coverage=${features.coverage.toFixed(3)}, Novelty=${features.novelty.toFixed(3)}, Activation=${features.tagMemoActivation.toFixed(3)}`);
+                console.log(`[TagMemo-V3] Effective Boost: ${effectiveTagBoost.toFixed(3)}`);
+            }
+
+            // [4] 收集金字塔中的所有 Tags 进行增强
+            const allTags = [];
+            pyramid.levels.forEach(level => {
+                level.tags.forEach(t => {
+                    const layerDecay = Math.pow(0.7, level.level);
+                    allTags.push({ ...t, adjustedWeight: t.weight * layerDecay });
+                });
+            });
+
+            if (allTags.length === 0) return { vector: originalFloat32, info: null };
+
+            // [5] 构建上下文向量
+            const contextVec = new Float32Array(dim);
+            let totalWeight = 0;
+            
+            for (const t of allTags) {
+                const row = this.db.prepare("SELECT vector FROM tags WHERE id = ?").get(t.id);
+                if (row && row.vector) {
+                    const v = new Float32Array(row.vector.buffer, row.vector.byteOffset, dim);
+                    for (let d = 0; d < dim; d++) contextVec[d] += v[d] * t.adjustedWeight;
+                    totalWeight += t.adjustedWeight;
+                }
+            }
+
+            if (totalWeight > 0) {
+                // 归一化上下文向量
+                let mag = 0;
+                for (let d = 0; d < dim; d++) {
+                    contextVec[d] /= totalWeight;
+                    mag += contextVec[d] * contextVec[d];
+                }
+                mag = Math.sqrt(mag);
+                if (mag > 1e-9) for (let d = 0; d < dim; d++) contextVec[d] /= mag;
+            } else {
+                return { vector: originalFloat32, info: null };
+            }
+
+            // [6] 最终融合
+            const fused = new Float32Array(dim);
+            let fusedMag = 0;
+            for (let d = 0; d < dim; d++) {
+                fused[d] = (1 - effectiveTagBoost) * originalFloat32[d] + effectiveTagBoost * contextVec[d];
+                fusedMag += fused[d] * fused[d];
+            }
+            
+            fusedMag = Math.sqrt(fusedMag);
+            if (fusedMag > 1e-9) for (let d = 0; d < dim; d++) fused[d] /= fusedMag;
+
+            return {
+                vector: fused,
+                info: {
+                    matchedTags: allTags.map(t => t.name),
+                    boostFactor: effectiveTagBoost,
+                    epa: { logicDepth, entropy: entropyPenalty, resonance: resonance.resonance },
+                    pyramid: { coverage: features.coverage, novelty: features.novelty, depth: features.depth }
+                }
+            };
+
+        } catch (e) {
+            console.error('[KnowledgeBase] TagMemo V3 CRITICAL FAIL:', e);
+            return { vector: originalFloat32, info: null };
+        }
+    }
+
+    /**
      * 公共接口：应用 TagMemo 增强向量
      * @param {Float32Array|Array<number>} vector - 原始查询向量
      * @param {number} tagBoost - 增强因子 (0 到 1)
@@ -562,6 +675,24 @@ class KnowledgeBaseManager {
     applyTagBoost(vector, tagBoost) {
         // 包装私有方法，提供稳定的公共接口
         return this._applyTagBoost(vector, tagBoost);
+    }
+
+    /**
+     * 获取向量的 EPA 分析数据（逻辑深度、共振等）
+     */
+    getEPAAnalysis(vector) {
+        if (!this.epa || !this.epa.initialized) {
+            return { logicDepth: 0.5, resonance: 0, entropy: 0.5, dominantAxes: [] };
+        }
+        const vec = vector instanceof Float32Array ? vector : new Float32Array(vector);
+        const projection = this.epa.project(vec);
+        const resonance = this.epa.detectCrossDomainResonance(vec);
+        return {
+            logicDepth: projection.logicDepth,
+            entropy: projection.entropy,
+            resonance: resonance.resonance,
+            dominantAxes: projection.dominantAxes
+        };
     }
  
     // =========================================================================
