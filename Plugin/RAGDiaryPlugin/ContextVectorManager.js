@@ -20,7 +20,8 @@ class ContextVectorManager {
         
         // 模糊匹配阈值 (0.0 ~ 1.0)，用于判断两个文本是否足够相似以复用向量，因为是用于提取特征向量所以模糊程度可以大一点
         this.fuzzyThreshold = 0.85;
-        this.decayRate = 0.85; // 默认衰减率
+        this.decayRate = 0.75; // 🌟 衰减率加快 (0.85 -> 0.75)
+        this.maxContextWindow = 10; // 🌟 限制聚合窗口为最近 10 楼
     }
 
     /**
@@ -31,6 +32,7 @@ class ContextVectorManager {
         // 复用插件的清理逻辑
         let cleaned = this.plugin._stripHtml(text);
         cleaned = this.plugin._stripEmoji(cleaned);
+        cleaned = this.plugin._stripToolMarkers(cleaned); // ✅ 新增：同步净化工具调用噪音
         // 移除多余空格、换行，转小写
         return cleaned.toLowerCase()
             .replace(/\s+/g, ' ')
@@ -86,9 +88,11 @@ class ContextVectorManager {
     /**
      * 更新上下文映射
      * @param {Array} messages - 当前会话的消息数组
+     * @param {Object} options - 配置项 { allowApi: false }
      */
-    async updateContext(messages) {
+    async updateContext(messages, options = {}) {
         if (!Array.isArray(messages)) return;
+        const { allowApi = false } = options;
 
         const newAssistantVectors = [];
         const newUserVectors = [];
@@ -102,8 +106,8 @@ class ContextVectorManager {
             if (msg.role === 'system') return;
             if (index === lastUserIndex || index === lastAiIndex) return;
 
-            const content = typeof msg.content === 'string' 
-                ? msg.content 
+            const content = typeof msg.content === 'string'
+                ? msg.content
                 : (Array.isArray(msg.content) ? msg.content.find(p => p.type === 'text')?.text : '') || '';
             
             if (!content || content.length < 2) return;
@@ -116,13 +120,18 @@ class ContextVectorManager {
             // 1. 精确匹配
             if (this.vectorMap.has(hash)) {
                 vector = this.vectorMap.get(hash).vector;
-            } 
+            }
             // 2. 模糊匹配 (处理微小编辑)
             else {
                 vector = this._findFuzzyMatch(normalized);
                 
-                // 3. 如果都没有，则请求新向量
+                // 3. 尝试从插件的 Embedding 缓存中获取（不触发 API）
                 if (!vector) {
+                    vector = this.plugin._getEmbeddingFromCacheOnly(content);
+                }
+
+                // 4. 如果缓存也没有，且允许 API，则请求新向量（触发 API）
+                if (!vector && allowApi) {
                     vector = await this.plugin.getSingleEmbeddingCached(content);
                 }
 
@@ -176,8 +185,13 @@ class ContextVectorManager {
      * @returns {Float32Array|null} 聚合后的向量
      */
     aggregateContext(role = 'assistant') {
-        const vectors = role === 'assistant' ? this.historyAssistantVectors : this.historyUserVectors;
+        let vectors = role === 'assistant' ? this.historyAssistantVectors : this.historyUserVectors;
         if (vectors.length === 0) return null;
+
+        // 🌟 限制窗口：只取最近的 maxContextWindow 楼层
+        if (vectors.length > this.maxContextWindow) {
+            vectors = vectors.slice(-this.maxContextWindow);
+        }
 
         const dim = vectors[0].length;
         const aggregated = new Float32Array(dim);
@@ -186,7 +200,6 @@ class ContextVectorManager {
         // 这里的 index 越大表示越接近当前楼层
         vectors.forEach((vector, idx) => {
             // 指数衰减：越早的楼层权重越低
-            // 假设当前楼层是 vectors.length
             const age = vectors.length - idx;
             const weight = Math.pow(this.decayRate, age);
 
