@@ -64,7 +64,6 @@ class RAGDiaryPlugin {
         this.embeddingCacheHits = 0; // 统计向量缓存命中次数
         this.embeddingCacheMisses = 0; // 统计向量缓存未命中次数
 
-
         // ✅ 新增：AIMemo 缓存
         this.aiMemoCache = new Map();
         this.aiMemoCacheMaxSize = 50; // 可配置
@@ -299,7 +298,6 @@ class RAGDiaryPlugin {
         // ✅ 启动向量缓存清理任务
         this._startEmbeddingCacheCleanupTask();
 
-
         // ✅ 启动 AIMemo 缓存清理任务
         this._startAiMemoCacheCleanupTask();
 
@@ -355,8 +353,8 @@ class RAGDiaryPlugin {
             const vector = validVectors[i];
             const weight = normalizedWeights[i];
             if (vector.length !== dimension) {
-                 console.error('[RAGDiaryPlugin] Vector dimensions do not match. Skipping mismatched vector.');
-                 continue;
+                console.error('[RAGDiaryPlugin] Vector dimensions do not match. Skipping mismatched vector.');
+                continue;
             }
             for (let j = 0; j < dimension; j++) {
                 result[j] += vector[j] * weight;
@@ -415,7 +413,7 @@ class RAGDiaryPlugin {
             }
         } catch (charDirError) {
             if (charDirError.code !== 'ENOENT') {
-                 console.error(`[RAGDiaryPlugin] Error reading character directory ${characterDirPath}:`, charDirError.message);
+                console.error(`[RAGDiaryPlugin] Error reading character directory ${characterDirPath}:`, charDirError.message);
             }
             characterDiaryContent = `[无法读取“${characterName}”的日记本，可能不存在]`;
         }
@@ -779,7 +777,7 @@ class RAGDiaryPlugin {
                     if (/\[\[.*日记本.*\]\]|<<.*日记本.*>>|《《.*日记本.*》》|\[\[VCP元思考.*\]\]|\[\[AIMemo=True\]\]/.test(m.content)) {
                         // 确保每个包含占位符的 system 消息都被处理
                         if (!acc.includes(index)) {
-                           acc.push(index);
+                            acc.push(index);
                         }
                     }
                 }
@@ -875,6 +873,13 @@ class RAGDiaryPlugin {
             // 🌟 V3 增强：计算动态参数 (K, TagWeight)
             const dynamicParams = await this._calculateDynamicParams(queryVector, userContent, aiContent);
 
+            // 🌟 Tagmemo V4: 获取上下文分段 (Segments)
+            // 结合当前查询向量和历史主题分段，形成"霰弹枪"查询阵列
+            const historySegments = this.contextVectorManager.segmentContext(messages);
+            if (historySegments.length > 0) {
+                console.log(`[RAGDiaryPlugin] Tagmemo V4: Detected ${historySegments.length} history segments.`);
+            }
+
             const combinedTextForTimeParsing = [userContent, aiContent].filter(Boolean).join('\n');
             const timeRanges = this.timeParser.parse(combinedTextForTimeParsing);
 
@@ -898,7 +903,8 @@ class RAGDiaryPlugin {
                     isAIMemoLicensed, // 新增：AIMemo许可证
                     dynamicParams.tagWeight, // 🌟 传递动态 Tag 权重
                     dynamicParams.tagTruncationRatio, // 🌟 传递动态截断比例
-                    dynamicParams.metrics // 传递指标用于日志
+                    dynamicParams.metrics, // 传递指标用于日志
+                    historySegments // 🌟 Tagmemo V4: 传递历史分段
                 );
 
                 newMessages[index].content = processedContent;
@@ -925,7 +931,7 @@ class RAGDiaryPlugin {
     }
 
     // V3.0 新增: 处理单条 system 消息内容的辅助函数
-    async _processSingleSystemMessage(content, queryVector, userContent, aiContent, combinedQueryForDisplay, dynamicK, timeRanges, processedDiaries, isAIMemoLicensed, dynamicTagWeight = 0.15, tagTruncationRatio = 0.5, metrics = {}) {
+    async _processSingleSystemMessage(content, queryVector, userContent, aiContent, combinedQueryForDisplay, dynamicK, timeRanges, processedDiaries, isAIMemoLicensed, dynamicTagWeight = 0.15, tagTruncationRatio = 0.5, metrics = {}, historySegments = []) {
         if (!this.pushVcpInfo) {
             console.warn('[RAGDiaryPlugin] _processSingleSystemMessage: pushVcpInfo is null. Cannot broadcast RAG details.');
         }
@@ -1019,8 +1025,52 @@ class RAGDiaryPlugin {
         // --- 1. 收集 [[...]] 中的 AIMemo 请求 ---
         for (const match of ragDeclarations) {
             const placeholder = match[0];
-            const dbName = match[1];
+            const rawName = match[1];
             const modifiers = match[2] || '';
+
+            // 🌟 V5: 解析聚合语法
+            const aggregateInfo = this._parseAggregateSyntax(rawName, modifiers);
+
+            if (aggregateInfo.isAggregate) {
+                // --- 聚合模式 ---
+                // 核心逻辑：只有在许可证存在的情况下，::AIMemo才生效
+                const shouldUseAIMemo = isAIMemoLicensed && modifiers.includes('::AIMemo');
+
+                if (shouldUseAIMemo) {
+                    // AIMemo 聚合模式：将所有日记本名收集到 aiMemoRequests
+                    console.log(`[RAGDiaryPlugin] 🌟 聚合AIMemo模式: ${aggregateInfo.diaryNames.join(', ')}`);
+                    for (const name of aggregateInfo.diaryNames) {
+                        if (!processedDiaries.has(name)) {
+                            aiMemoRequests.push({ placeholder: placeholder, dbName: name });
+                        }
+                    }
+                } else {
+                    // 标准聚合 RAG
+                    processingPromises.push((async () => {
+                        try {
+                            const retrievedContent = await this._processAggregateRetrieval({
+                                diaryNames: aggregateInfo.diaryNames,
+                                kMultiplier: aggregateInfo.kMultiplier,
+                                modifiers, queryVector, userContent, aiContent, combinedQueryForDisplay,
+                                dynamicK, timeRanges,
+                                defaultTagWeight: dynamicTagWeight,
+                                tagTruncationRatio: tagTruncationRatio,
+                                metrics: metrics,
+                                historySegments: historySegments,
+                                processedDiaries: processedDiaries
+                            });
+                            return { placeholder, content: retrievedContent };
+                        } catch (error) {
+                            console.error(`[RAGDiaryPlugin] 聚合检索处理失败:`, error);
+                            return { placeholder, content: `[聚合检索处理失败: ${error.message}]` };
+                        }
+                    })());
+                }
+                continue; // 聚合模式处理完毕，跳过下面的单日记本逻辑
+            }
+
+            // --- 单日记本模式（原有逻辑） ---
+            const dbName = aggregateInfo.diaryNames[0];
 
             if (processedDiaries.has(dbName)) {
                 console.warn(`[RAGDiaryPlugin] Detected circular reference to "${dbName}" in [[...]]. Skipping.`);
@@ -1044,7 +1094,8 @@ class RAGDiaryPlugin {
                             dynamicK, timeRanges, allowTimeAndGroup: true,
                             defaultTagWeight: dynamicTagWeight, // 🌟 传入动态权重
                             tagTruncationRatio: tagTruncationRatio, // 🌟 传入截断比例
-                            metrics: metrics
+                            metrics: metrics,
+                            historySegments: historySegments // 🌟 传入历史分段
                         });
                         return { placeholder, content: retrievedContent };
                     } catch (error) {
@@ -1120,8 +1171,78 @@ class RAGDiaryPlugin {
         // --- 3. 收集 《《...》》 混合模式中的 AIMemo 请求 ---
         for (const match of hybridDeclarations) {
             const placeholder = match[0];
-            const dbName = match[1];
+            const rawName = match[1];
             const modifiers = match[2] || '';
+
+            // 🌟 V5: 解析聚合语法
+            const aggregateInfo = this._parseAggregateSyntax(rawName, modifiers);
+
+            if (aggregateInfo.isAggregate) {
+                // --- 《《》》聚合模式 ---
+                processingPromises.push((async () => {
+                    try {
+                        // 使用平均阈值进行相似度门控
+                        const avgThreshold = this._getAverageThreshold(aggregateInfo.diaryNames);
+
+                        // 计算聚合整体的相似度：取所有日记本的最大相似度
+                        let maxSimilarity = 0;
+                        for (const name of aggregateInfo.diaryNames) {
+                            try {
+                                let diaryVec = this.enhancedVectorCache[name] || null;
+                                if (!diaryVec) {
+                                    diaryVec = await this.vectorDBManager.getDiaryNameVector(name);
+                                }
+                                if (diaryVec) {
+                                    const sim = this.cosineSimilarity(queryVector, diaryVec);
+                                    maxSimilarity = Math.max(maxSimilarity, sim);
+                                }
+                            } catch (e) {
+                                console.warn(`[RAGDiaryPlugin] 《《》》聚合阈值检查: "${name}" 向量获取失败, 跳过`);
+                            }
+                        }
+
+                        if (maxSimilarity < avgThreshold) {
+                            console.log(`[RAGDiaryPlugin] 《《》》聚合模式: 最高相似度 (${maxSimilarity.toFixed(4)}) 低于平均阈值 (${avgThreshold.toFixed(4)})，跳过`);
+                            return { placeholder, content: '' };
+                        }
+
+                        console.log(`[RAGDiaryPlugin] 🌟 《《》》聚合模式: 通过阈值 (${maxSimilarity.toFixed(4)} >= ${avgThreshold.toFixed(4)})，开始检索...`);
+
+                        // AIMemo 检查
+                        const shouldUseAIMemo = isAIMemoLicensed && modifiers.includes('::AIMemo');
+                        if (shouldUseAIMemo) {
+                            console.log(`[RAGDiaryPlugin] 🌟 《《》》聚合AIMemo模式: ${aggregateInfo.diaryNames.join(', ')}`);
+                            for (const name of aggregateInfo.diaryNames) {
+                                if (!processedDiaries.has(name)) {
+                                    aiMemoRequests.push({ placeholder: placeholder, dbName: name });
+                                }
+                            }
+                            return { placeholder, content: '' };
+                        }
+
+                        // 标准聚合 RAG
+                        const retrievedContent = await this._processAggregateRetrieval({
+                            diaryNames: aggregateInfo.diaryNames,
+                            kMultiplier: aggregateInfo.kMultiplier,
+                            modifiers, queryVector, userContent, aiContent, combinedQueryForDisplay,
+                            dynamicK, timeRanges,
+                            defaultTagWeight: dynamicTagWeight,
+                            tagTruncationRatio: tagTruncationRatio,
+                            metrics: metrics,
+                            historySegments: historySegments,
+                            processedDiaries: processedDiaries
+                        });
+                        return { placeholder, content: retrievedContent };
+                    } catch (error) {
+                        console.error(`[RAGDiaryPlugin] 《《》》聚合检索处理失败:`, error);
+                        return { placeholder, content: `[聚合检索处理失败: ${error.message}]` };
+                    }
+                })());
+                continue; // 聚合模式处理完毕
+            }
+
+            // --- 单日记本模式（原有逻辑） ---
+            const dbName = aggregateInfo.diaryNames[0];
 
             if (processedDiaries.has(dbName)) {
                 console.warn(`[RAGDiaryPlugin] Detected circular reference to "${dbName}" in 《《...》》. Skipping.`);
@@ -1179,7 +1300,8 @@ class RAGDiaryPlugin {
                                 dynamicK, timeRanges, allowTimeAndGroup: true,
                                 defaultTagWeight: dynamicTagWeight, // 🌟 传入动态权重
                                 tagTruncationRatio: tagTruncationRatio, // 🌟 传入截断比例
-                                metrics: metrics
+                                metrics: metrics,
+                                historySegments: historySegments // 🌟 传入历史分段
                             });
 
                             // ✅ 缓存结果（RAG已在内部缓存，这里是额外保险）
@@ -1265,6 +1387,215 @@ class RAGDiaryPlugin {
         return kMultiplierMatch ? parseFloat(kMultiplierMatch[1]) : 1.0;
     }
 
+    //####################################################################################
+    //## 🌟 V5 日记聚合检索 (Diary Aggregate Retrieval)
+    //####################################################################################
+
+    /**
+     * 解析聚合语法：从 rawName 中拆分多日记本名列表和 kMultiplier
+     * 语法: "物理|政治|python:1.2" → { diaryNames: ['物理','政治','python'], kMultiplier: 1.2, isAggregate: true }
+     * 单日记本: "物理" → { diaryNames: ['物理'], kMultiplier: 1.0, isAggregate: false }
+     * @param {string} rawName - 日记本名部分（`日记本`关键字前的所有内容）
+     * @param {string} modifiers - 修饰符部分（`日记本`关键字后的所有内容）
+     * @returns {{ diaryNames: string[], kMultiplier: number, isAggregate: boolean, cleanedModifiers: string }}
+     */
+    _parseAggregateSyntax(rawName, modifiers) {
+        // 检查是否包含 | 分隔符 → 聚合模式
+        if (!rawName.includes('|')) {
+            return {
+                diaryNames: [rawName],
+                kMultiplier: this._extractKMultiplier(modifiers),
+                isAggregate: false,
+                cleanedModifiers: modifiers
+            };
+        }
+
+        // 聚合模式: 按 | 拆分，所有部分都是日记本名
+        const diaryNames = rawName.split('|').map(p => p.trim()).filter(Boolean);
+        // kMultiplier 统一从 modifiers 的 :1.5 提取，保持与单日记本语法一致
+        const kMultiplier = this._extractKMultiplier(modifiers);
+
+        // 至少需要 2 个日记本名才算聚合
+        if (diaryNames.length < 2) {
+            return {
+                diaryNames: diaryNames,
+                kMultiplier: kMultiplier,
+                isAggregate: false,
+                cleanedModifiers: modifiers
+            };
+        }
+
+        console.log(`[RAGDiaryPlugin] 🌟 聚合检索语法解析成功: 日记本=[${diaryNames.join(', ')}], K倍率=${kMultiplier}`);
+
+        return {
+            diaryNames: diaryNames,
+            kMultiplier: kMultiplier,
+            isAggregate: true,
+            cleanedModifiers: modifiers
+        };
+    }
+
+    /**
+     * 🌟 聚合检索核心调度器
+     * 根据上下文向量与各日记本向量的余弦相似度，通过 Softmax 归一化动态分配 K 值，
+     * 然后并行调用各子日记本的 _processRAGPlaceholder，最后聚合结果。
+     *
+     * @param {object} options - 包含所有必要参数
+     * @returns {Promise<string>} 聚合后的检索结果
+     */
+    async _processAggregateRetrieval(options) {
+        const {
+            diaryNames,
+            kMultiplier,
+            modifiers,
+            queryVector,
+            userContent,
+            aiContent,
+            combinedQueryForDisplay,
+            dynamicK,
+            timeRanges,
+            defaultTagWeight,
+            tagTruncationRatio,
+            metrics,
+            historySegments,
+            processedDiaries // 🛡️ 循环引用检测
+        } = options;
+
+        const totalK = Math.max(1, Math.round(dynamicK * kMultiplier));
+        const config = this.ragParams?.RAGDiaryPlugin || {};
+        const temperature = config.aggregateTemperature ?? 3.0;
+        const minKPerDiary = config.aggregateMinK ?? 1;
+
+        console.log(`[RAGDiaryPlugin] 🌟 聚合检索启动: ${diaryNames.length} 个日记本, 总K=${totalK}, 温度=${temperature}`);
+
+        // --- Step 1: 获取各日记本的代表向量并计算相似度 ---
+        const diaryScores = [];
+        for (const name of diaryNames) {
+            // 循环引用检测
+            if (processedDiaries && processedDiaries.has(name)) {
+                console.warn(`[RAGDiaryPlugin] 聚合模式: 检测到循环引用 "${name}"，跳过`);
+                continue;
+            }
+
+            try {
+                // 优先使用标签组网向量 (enhancedVectorCache)，回退到纯名字向量
+                let diaryVec = this.enhancedVectorCache[name] || null;
+                if (!diaryVec) {
+                    diaryVec = await this.vectorDBManager.getDiaryNameVector(name);
+                }
+
+                if (!diaryVec) {
+                    console.warn(`[RAGDiaryPlugin] 聚合模式: 无法获取 "${name}" 的向量，跳过`);
+                    continue;
+                }
+
+                const sim = this.cosineSimilarity(queryVector, diaryVec);
+                diaryScores.push({ name, similarity: sim });
+                console.log(`[RAGDiaryPlugin]   → "${name}" 相似度: ${sim.toFixed(4)}`);
+            } catch (e) {
+                console.error(`[RAGDiaryPlugin] 聚合模式: 获取 "${name}" 向量时出错:`, e.message);
+                // 不崩溃，继续处理其他日记本
+            }
+        }
+
+        // 🛡️ 如果没有任何有效的日记本，返回空
+        if (diaryScores.length === 0) {
+            console.warn('[RAGDiaryPlugin] 聚合检索: 没有有效的日记本可供检索。');
+            return '';
+        }
+
+        // --- Step 2: Softmax 归一化分配 K 值 ---
+        // 计算 exp(sim * temperature) 用于 softmax
+        const expScores = diaryScores.map(d => Math.exp(d.similarity * temperature));
+        const expSum = expScores.reduce((sum, v) => sum + v, 0);
+        const weights = expScores.map(v => v / expSum);
+
+        // 分配 K 值，确保每个日记本至少获得 minKPerDiary
+        const reservedK = minKPerDiary * diaryScores.length;
+        const distributableK = Math.max(0, totalK - reservedK);
+
+        const kAllocations = weights.map((w, i) => {
+            const allocated = minKPerDiary + Math.round(distributableK * w);
+            return {
+                name: diaryScores[i].name,
+                similarity: diaryScores[i].similarity,
+                weight: w,
+                k: Math.max(minKPerDiary, allocated)
+            };
+        });
+
+        // 日志输出分配结果
+        console.log(`[RAGDiaryPlugin] 🌟 K 分配结果:`);
+        kAllocations.forEach(a => {
+            console.log(`[RAGDiaryPlugin]   → "${a.name}": sim=${a.similarity.toFixed(4)}, weight=${(a.weight * 100).toFixed(1)}%, k=${a.k}`);
+        });
+
+        // --- Step 3: 并行调用各日记本的检索 ---
+        // 🛡️ 去除 modifiers 中的 kMultiplier，防止 _processRAGPlaceholder 内部再次乘以 kMultiplier
+        const cleanedModifiers = modifiers.replace(/^:\d+\.?\d*/, '');
+
+        const retrievalPromises = kAllocations.map(async (allocation) => {
+            // 标记为已处理，防止循环引用
+            if (processedDiaries) processedDiaries.add(allocation.name);
+
+            try {
+                const content = await this._processRAGPlaceholder({
+                    dbName: allocation.name,
+                    modifiers: cleanedModifiers,
+                    queryVector,
+                    userContent,
+                    aiContent,
+                    combinedQueryForDisplay,
+                    dynamicK: allocation.k, // 🌟 使用分配后的 K 值（直接作为 dynamicK，kMultiplier 在聚合层已经处理）
+                    timeRanges,
+                    allowTimeAndGroup: true,
+                    defaultTagWeight,
+                    tagTruncationRatio,
+                    metrics,
+                    historySegments
+                });
+                return { name: allocation.name, content, k: allocation.k, success: true };
+            } catch (e) {
+                console.error(`[RAGDiaryPlugin] 聚合模式: "${allocation.name}" 检索失败:`, e.message);
+                return { name: allocation.name, content: '', k: allocation.k, success: false };
+            }
+        });
+
+        const results = await Promise.all(retrievalPromises);
+
+        // --- Step 4: 聚合各日记本的检索结果 ---
+        // 保持与现有多日记本显示格式一致：每个日记本独立展示
+        const aggregatedContent = results
+            .filter(r => r.content && r.content.trim().length > 0)
+            .map(r => r.content)
+            .join('\n');
+
+        if (!aggregatedContent) {
+            console.log('[RAGDiaryPlugin] 聚合检索: 所有日记本均未返回结果。');
+            return '';
+        }
+
+        console.log(`[RAGDiaryPlugin] 🌟 聚合检索完成: ${results.filter(r => r.success && r.content).length}/${diaryNames.length} 个日记本返回了结果`);
+        return aggregatedContent;
+    }
+
+    /**
+     * 🌟 聚合检索: 《《》》全文模式的阈值计算
+     * 使用各日记本单独阈值的平均值
+     * @param {string[]} diaryNames - 日记本名列表
+     * @returns {number} 平均阈值
+     */
+    _getAverageThreshold(diaryNames) {
+        let totalThreshold = 0;
+        let count = 0;
+        for (const name of diaryNames) {
+            const diaryConfig = this.ragConfig[name] || {};
+            totalThreshold += diaryConfig.threshold || GLOBAL_SIMILARITY_THRESHOLD;
+            count++;
+        }
+        return count > 0 ? totalThreshold / count : GLOBAL_SIMILARITY_THRESHOLD;
+    }
+
     /**
      * 刷新一个RAG区块
      * @param {object} metadata - 从HTML注释中解析出的元数据 {dbName, modifiers, k}
@@ -1340,7 +1671,6 @@ class RAGDiaryPlugin {
             combinedQueryForDisplay: combinedSanitizedContext, // ✅ 使用组合后的上下文进行显示
             dynamicK: metadata.k || 5,
             timeRanges: this.timeParser.parse(combinedSanitizedContext), // ✅ 基于组合后的上下文重新解析时间
-            allowTimeAndGroup: true
         });
 
         // 6. 返回完整的、带有新元数据的新区块文本
@@ -1360,7 +1690,8 @@ class RAGDiaryPlugin {
             allowTimeAndGroup = true,
             defaultTagWeight = 0.15, // 🌟 新增默认权重参数
             tagTruncationRatio = 0.5, // 🌟 新增截断比例
-            metrics = {}
+            metrics = {},
+            historySegments = [] // 🌟 Tagmemo V4
         } = options;
 
         // 1️⃣ 生成缓存键
@@ -1483,18 +1814,69 @@ class RAGDiaryPlugin {
 
         } else {
             // --- Standard path (no time filter) ---
-            let searchResults = await this.vectorDBManager.search(dbName, finalQueryVector, kForSearch, tagWeight, coreTagsForSearch);
 
-            if (useRerank) {
-                searchResults = await this._rerankDocuments(userContent, searchResults, finalK);
+            // 🌟 Tagmemo V4: Shotgun Query Implementation
+            let searchVectors = [{ vector: finalQueryVector, type: 'current' }];
+
+            // 仅在存在历史分段且未使用 Time 模式时启用霰弹枪 (Time 模式通常很精确)
+            if (historySegments && historySegments.length > 0) {
+                // 限制: 最多取最近的 3 个分段，防止查询爆炸
+                const recentSegments = historySegments.slice(-3);
+                recentSegments.forEach((seg, idx) => {
+                    searchVectors.push({ vector: seg.vector, type: `history_${idx}` });
+                });
             }
 
-            finalResultsForBroadcast = searchResults.map(r => ({ ...r, source: 'rag' }));
+            console.log(`[RAGDiaryPlugin] Shotgun Query: Executing ${searchVectors.length} parallel searches...`);
+
+            const searchPromises = searchVectors.map(async (qv) => {
+                try {
+                    // 每个向量都独立进行检索
+                    // 注意：这里我们复用 coreTagsForSearch，虽然它是基于当前 queryVector 生成的
+                    // 理想情况下应该为每个 segment 生成 coreTags，但为了性能暂且复用（假设上下文主题有一定的连续性）
+                    // 或者：对于 history segment，不使用 tag boost，仅纯向量检索?
+                    // 决策：为了保持语义连贯，我们对 history segment 使用较小的 k (e.g. k/2) 和 默认 tagWeight
+
+                    const k = qv.type === 'current' ? kForSearch : Math.max(2, Math.round(kForSearch / 2));
+
+                    return await this.vectorDBManager.search(dbName, qv.vector, k, tagWeight, coreTagsForSearch);
+                } catch (e) {
+                    console.error(`[RAGDiaryPlugin] Shotgun search failed for ${qv.type}:`, e.message);
+                    return [];
+                }
+            });
+
+            const resultsArrays = await Promise.all(searchPromises);
+            const flattenedResults = resultsArrays.flat();
+
+            // 🌟 Tagmemo V4: Intelligent Deduplication
+            // 使用 KnowledgeBaseManager 提供的去重接口 (封装了 SVD + Residual)
+            const uniqueResults = await this.vectorDBManager.deduplicateResults(flattenedResults, finalQueryVector);
+
+            if (useRerank) {
+                // Rerank 放在去重之后，节省 Rerank Token
+                // 注意：useRerank 逻辑中是先 rerank 再 slice(0, k)
+                // 这里我们去重后可能数量仍多于 k，需要 rerank 排序截断
+                // 但是 _rerankDocuments 会返回前 k 个。
+
+                // 为了让 Rerank 看到足够多的样本，我们先不截断，但去重已经大大减少了样本量
+                let finalKForRerank = finalK;
+                // 如果是 Shotgun，我们可能希望最终结果稍微丰富一点点？不，保持用户设定的 k
+
+                finalResultsForBroadcast = await this._rerankDocuments(userContent, uniqueResults, finalKForRerank);
+            } else {
+                // 如果没有 Rerank，按 score (或去重后的顺序) 截断
+                // 去重后的结果通常是按"残差贡献度"排序的，所以直接截断是合理的
+                finalResultsForBroadcast = uniqueResults.slice(0, finalK);
+            }
+
+            // ✅ 统一添加 source 标识，防止 VCP Info 显示 unknown
+            finalResultsForBroadcast = finalResultsForBroadcast.map(r => ({ ...r, source: 'rag' }));
 
             if (useGroup) {
-                retrievedContent = this.formatGroupRAGResults(searchResults, displayName, activatedGroups, metadata);
+                retrievedContent = this.formatGroupRAGResults(finalResultsForBroadcast, displayName, activatedGroups, metadata);
             } else {
-                retrievedContent = this.formatStandardResults(searchResults, displayName, metadata);
+                retrievedContent = this.formatStandardResults(finalResultsForBroadcast, displayName, metadata);
             }
         }
 
@@ -1548,7 +1930,7 @@ class RAGDiaryPlugin {
                             dbName: dbName,
                             error: 'Detailed stats broadcast failed: ' + (innerError.message || 'Unknown error')
                         });
-                    } catch (e) {}
+                    } catch (e) { }
                 }
             } catch (broadcastError) {
                 console.error(`[RAGDiaryPlugin] Critical error during VCPInfo preparation:`, broadcastError.message || broadcastError);
@@ -1612,7 +1994,7 @@ class RAGDiaryPlugin {
             }
         } catch (dirError) {
             if (dirError.code !== 'ENOENT') {
-                 console.error(`[RAGDiaryPlugin] Error reading character directory for time filter ${characterDirPath}:`, dirError.message);
+                console.error(`[RAGDiaryPlugin] Error reading character directory for time filter ${characterDirPath}:`, dirError.message);
             }
         }
         return diariesInRange;

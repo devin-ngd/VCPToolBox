@@ -49,7 +49,6 @@ function resolveAgentDir() {
     const absolutePath = path.isAbsolute(normalizedPath)
         ? normalizedPath
         : path.resolve(__dirname, normalizedPath);
-
     return absolutePath;
 }
 
@@ -63,7 +62,6 @@ async function ensureAgentDirectory() {
     } catch (error) {
         if (error.code !== 'EEXIST') {
             console.error(`[Server] Failed to create Agent directory: ${AGENT_DIR}`);
-
             if (error.code === 'EACCES' || error.code === 'EPERM') {
                 console.error('[Server] Error: Permission denied');
             } else if (error.code === 'ENOENT') {
@@ -73,7 +71,6 @@ async function ensureAgentDirectory() {
             } else if (error.code === 'ENAMETOOLONG') {
                 console.error('[Server] Error: Path is too long');
             }
-
             process.exit(1);
         }
     }
@@ -1224,24 +1221,17 @@ async function initialize() {
 // Store the server instance globally so it can be accessed by gracefulShutdown
 let server;
 
-server = app.listen(port, async () => { // Assign to server variable
+async function startServer() {
     await loadBlacklist(); // 新增：在服务器启动时加载IP黑名单
 
     // 确保 Agent 目录存在
     await ensureAgentDirectory();
-
-    console.log(`中间层服务器正在监听端口 ${port}`);
-    console.log(`API 服务器地址: ${apiUrl}`);
 
     // 新增：加载模型重定向配置
     console.log('正在加载模型重定向配置...');
     modelRedirectHandler.setDebugMode(DEBUG_MODE);
     await modelRedirectHandler.loadModelRedirectConfig(path.join(__dirname, 'ModelRedirect.json'));
     console.log('模型重定向配置加载完成。');
-
-    // ensureDebugLogDir() is effectively handled by initializeServerLogger() synchronously earlier.
-    // If ensureDebugLogDirAsync was meant for other purposes, it can be called where needed.
-
     // 新增：初始化Agent管理器
     console.log('正在初始化Agent管理器...');
     agentManager.setAgentDir(AGENT_DIR);
@@ -1252,23 +1242,31 @@ server = app.listen(port, async () => { // Assign to server variable
     tvsManager.initialize(DEBUG_MODE);
     console.log('TVS管理器初始化完成。');
 
+    // 🌟 关键修复：在监听端口前完成所有初始化
     await initialize(); // This loads plugins and initializes services
 
-    // Initialize the new WebSocketServer
-    if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
-    const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
-    webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
+    server = app.listen(port, () => {
+        console.log(`中间层服务器正在监听端口 ${port}`);
+        console.log(`API 服务器地址: ${apiUrl}`);
 
-    // --- 注入依赖 ---
-    // pluginManager.setWebSocketServer(webSocketServer); // 已移动到 initializeServices 之前
-    webSocketServer.setPluginManager(pluginManager);
+        // Initialize the new WebSocketServer
+        if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
+        const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
+        webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
 
-    // 初始化 FileFetcherServer
-    FileFetcherServer.initialize(webSocketServer);
+        // --- 注入依赖 ---
+        webSocketServer.setPluginManager(pluginManager);
 
-    if (DEBUG_MODE) console.log('[Server] WebSocketServer, PluginManager, and FileFetcherServer have been interconnected.');
+        // 初始化 FileFetcherServer
+        FileFetcherServer.initialize(webSocketServer);
 
-    // The VCPLog plugin's attachWebSocketServer is no longer needed here as WebSocketServer handles it.
+        if (DEBUG_MODE) console.log('[Server] WebSocketServer, PluginManager, and FileFetcherServer have been interconnected.');
+    });
+}
+
+startServer().catch(err => {
+    console.error('[Server] Failed to start server:', err);
+    process.exit(1);
 });
 
 

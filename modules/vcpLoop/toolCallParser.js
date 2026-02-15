@@ -12,8 +12,12 @@ class ToolCallParser {
    */
   static parse(content) {
     if (!content || typeof content !== 'string') return [];
+
+    // 移除 <think> 标签及其内容，防止解析思维链中的工具调用
+    const contentWithoutThink = content.replace(/<think>[\s\S]*?<\/think>/g, '');
     
     const toolCalls = [];
+    content = contentWithoutThink;
     let searchOffset = 0;
 
     while (searchOffset < content.length) {
@@ -49,6 +53,7 @@ class ToolCallParser {
     const args = {};
     let toolName = null;
     let isArchery = false;
+    let markHistory = false;
     let match;
 
     while ((match = paramRegex.exec(blockContent)) !== null) {
@@ -59,12 +64,14 @@ class ToolCallParser {
         toolName = trimmedValue;
       } else if (key === 'archery') {
         isArchery = trimmedValue === 'true' || trimmedValue === 'no_reply';
+      } else if (key === 'ink') {
+        markHistory = trimmedValue === 'mark_history';
       } else {
         args[key] = trimmedValue;
       }
     }
 
-    return toolName ? { name: toolName, args, archery: isArchery } : null;
+    return toolName ? { name: toolName, args, archery: isArchery, markHistory } : null;
   }
 
   /**
