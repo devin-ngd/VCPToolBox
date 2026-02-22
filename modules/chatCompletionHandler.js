@@ -96,15 +96,47 @@ async function getRealAuthCode(debugMode = false) {
 }
 
 // A helper function to handle fetch with retries for specific status codes
+// connectionTimeout: 连接超时安全网，防止上游 API 静默挂起导致永久等待（仅覆盖到收到响应头为止）
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 120000 } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   for (let i = 0; i < retries; i++) {
+    // 为每次尝试创建独立的中止控制器，用于超时保护
+    const attemptController = new AbortController();
+    let didTimeout = false;
+    const externalSignal = options.signal;
+
+    // 将外部中止信号转发给本次尝试的控制器
+    let removeExternalListener = null;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+      }
+      const forwardAbort = () => attemptController.abort();
+      externalSignal.addEventListener('abort', forwardAbort, { once: true });
+      removeExternalListener = () => externalSignal.removeEventListener('abort', forwardAbort);
+    }
+
+    // 设置连接超时
+    const timeoutId = connectionTimeout > 0
+      ? setTimeout(() => { didTimeout = true; attemptController.abort(); }, connectionTimeout)
+      : null;
+
+    const cleanup = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (removeExternalListener) removeExternalListener();
+    };
+
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, {
+        ...options,
+        signal: attemptController.signal,
+      });
+      cleanup();
+
       if (response.status === 500 || response.status === 503 || response.status === 429) {
         const currentDelay = delay * (i + 1);
         if (debugMode) {
@@ -115,19 +147,37 @@ async function fetchWithRetry(
         if (onRetry) {
           await onRetry(i + 1, { status: response.status, message: response.statusText });
         }
-        await new Promise(resolve => setTimeout(resolve, currentDelay)); // Increase delay for subsequent retries
-        continue; // Try again
+        await new Promise(resolve => setTimeout(resolve, currentDelay));
+        continue;
       }
-      return response; // Success or non-retriable error
+      return response;
     } catch (error) {
-      // If the request was aborted, don't retry, just rethrow the error immediately.
+      cleanup();
+
+      // 区分超时中止和外部中止
       if (error.name === 'AbortError') {
+        if (didTimeout) {
+          // 超时中止 → 视为可重试的网络错误
+          const msg = `Connection timed out after ${connectionTimeout / 1000}s`;
+          if (i === retries - 1) {
+            console.error(`[Fetch Retry] ${msg}. All retries exhausted.`);
+            throw new Error(msg);
+          }
+          if (debugMode) console.warn(`[Fetch Retry] ${msg}. Retrying... (${i + 1}/${retries})`);
+          if (onRetry) {
+            await onRetry(i + 1, { status: 'TIMEOUT', message: msg });
+          }
+          await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+          continue;
+        }
+        // 外部中止（用户取消）→ 不重试
         if (debugMode) console.log('[Fetch Retry] Request was aborted. No retries will be attempted.');
         throw error;
       }
+
       if (i === retries - 1) {
         console.error(`[Fetch Retry] All retries failed. Last error: ${error.message}`);
-        throw error; // Rethrow the last error after all retries fail
+        throw error;
       }
       if (debugMode) {
         console.warn(
@@ -368,26 +418,26 @@ class ChatCompletionHandler {
         if (DEBUG_MODE) await writeDebugLog('LogAfterInitialRoleDivider', originalBody.messages);
       }
 
-      let shouldProcessMedia = true;
+      let shouldProcessMedia = false;
       if (originalBody.messages && Array.isArray(originalBody.messages)) {
         for (const msg of originalBody.messages) {
           let foundPlaceholderInMsg = false;
           if (msg.role === 'user' || msg.role === 'system') {
-            if (typeof msg.content === 'string' && msg.content.includes('{{ShowBase64}}')) {
+            if (typeof msg.content === 'string' && msg.content.includes('{{TransBase64}}')) {
               foundPlaceholderInMsg = true;
-              msg.content = msg.content.replace(/\{\{ShowBase64\}\}/g, '');
+              msg.content = msg.content.replace(/\{\{TransBase64\}\}/g, '');
             } else if (Array.isArray(msg.content)) {
               for (const part of msg.content) {
-                if (part.type === 'text' && typeof part.text === 'string' && part.text.includes('{{ShowBase64}}')) {
+                if (part.type === 'text' && typeof part.text === 'string' && part.text.includes('{{TransBase64}}')) {
                   foundPlaceholderInMsg = true;
-                  part.text = part.text.replace(/\{\{ShowBase64\}\}/g, '');
+                  part.text = part.text.replace(/\{\{TransBase64\}\}/g, '');
                 }
               }
             }
           }
           if (foundPlaceholderInMsg) {
-            shouldProcessMedia = false;
-            if (DEBUG_MODE) console.log('[Server] Media processing disabled by {{ShowBase64}} placeholder.');
+            shouldProcessMedia = true;
+            if (DEBUG_MODE) console.log('[Server] Media translation enabled by {{TransBase64}} placeholder.');
             break;
           }
         }
