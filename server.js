@@ -30,6 +30,12 @@ const path = require('path');
 const { Writable } = require('stream');
 const fsSync = require('fs'); // Renamed to fsSync for clarity with fs.promises
 
+// 🌟 核心修复：彻底解放 Node.js 默认的全局连接池限制，防止底层网络排队导致 AdminPanel 死锁
+const http = require('http');
+const https = require('https');
+http.globalAgent.maxSockets = 10000;
+https.globalAgent.maxSockets = 10000;
+
 // 初始化日志记录器
 const logger = require('./modules/logger.js');
 logger.initializeServerLogger();
@@ -360,12 +366,12 @@ const adminAuth = (req, res, next) => {
             console.error('[AdminAuth] AdminUsername or AdminPassword not set in config.env. Admin panel is disabled.');
             // 对API和页面请求返回不同的错误格式
             if (req.path.startsWith('/admin_api') || (req.headers.accept && req.headers.accept.includes('application/json'))) {
-                 res.status(503).json({
+                res.status(503).json({
                     error: 'Service Unavailable: Admin credentials not configured.',
                     message: 'Please set AdminUsername and AdminPassword in the config.env file to enable the admin panel.'
                 });
             } else {
-                 res.status(503).send('<h1>503 Service Unavailable</h1><p>Admin credentials (AdminUsername, AdminPassword) are not configured in config.env. Please configure them to enable the admin panel.</p>');
+                res.status(503).send('<h1>503 Service Unavailable</h1><p>Admin credentials (AdminUsername, AdminPassword) are not configured in config.env. Please configure them to enable the admin panel.</p>');
             }
             return; // 停止进一步处理
         }
@@ -579,7 +585,7 @@ app.get('/v1/models', async (req, res) => {
         apiResponse.headers.forEach((value, name) => {
             // Avoid forwarding hop-by-hop headers
             if (!['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive'].includes(name.toLowerCase())) {
-                 res.setHeader(name, value);
+                res.setHeader(name, value);
             }
         });
 
@@ -589,10 +595,10 @@ app.get('/v1/models', async (req, res) => {
     } catch (error) {
         console.error('转发 /v1/models 请求时出错:', error.message, error.stack);
         if (!res.headersSent) {
-             res.status(500).json({ error: 'Internal Server Error', details: error.message });
+            res.status(500).json({ error: 'Internal Server Error', details: error.message });
         } else if (!res.writableEnded) {
-             console.error('[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.');
-             res.end();
+            console.error('[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.');
+            res.end();
         }
     }
 });
@@ -1013,7 +1019,7 @@ async function handleDiaryFromAIResponse(responseText) {
                     console.error('[handleDiaryFromAIResponse] Error executing DailyNoteWrite plugin:', pluginError.message, pluginError.stack);
                 }
             } else {
-                console.error('[handleDiaryFromAIResponse] Could not extract Maid, Date, or Content from daily note block:', { maidName, dateString, contentText: contentText?.substring(0,50) });
+                console.error('[handleDiaryFromAIResponse] Could not extract Maid, Date, or Content from daily note block:', { maidName, dateString, contentText: contentText?.substring(0, 50) });
             }
         }
     }
@@ -1032,7 +1038,8 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     pluginManager,
     logger.getServerLogPath, // Pass the getter function
     knowledgeBaseManager, // Pass the knowledgeBaseManager instance
-    AGENT_DIR // Pass the Agent directory path
+    AGENT_DIR, // Pass the Agent directory path
+    cachedEmojiLists
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -1206,11 +1213,11 @@ async function initialize() {
             if (DEBUG_MODE) console.log('[initialize] All available emoji lists loaded into cache.');
         }
     } catch (error) {
-         if (error.code === 'ENOENT') {
-             console.error(`[initialize] Error: Emoji list source directory not found: ${emojiListSourceDir}. Make sure the EmojiListGenerator plugin ran successfully.`); // Keep as error
-         } else {
+        if (error.code === 'ENOENT') {
+            console.error(`[initialize] Error: Emoji list source directory not found: ${emojiListSourceDir}. Make sure the EmojiListGenerator plugin ran successfully.`); // Keep as error
+        } else {
             console.error(`[initialize] Error reading emoji list source directory ${emojiListSourceDir}:`, error.message); // Keep as error
-         }
+        }
     }
     if (DEBUG_MODE) console.log('表情包列表缓存加载完成。');
 

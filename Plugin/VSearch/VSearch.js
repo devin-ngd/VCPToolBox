@@ -41,44 +41,52 @@ const resolveRedirect = async (url) => {
         targetUrl = 'https://' + targetUrl;
     }
 
-    // 递归解析，最多跳转 3 次
-    let currentUrl = targetUrl;
-    for (let i = 0; i < 3; i++) {
-        try {
-            const axiosConfig = {
-                maxRedirects: 0,
-                timeout: 10000,
-                validateStatus: (status) => status >= 200 && status < 400
-            };
+    try {
+        const axiosConfig = {
+            maxRedirects: 5,
+            timeout: 15000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            },
+            responseType: 'text'
+        };
 
-            if (PROXY) {
-                axiosConfig.httpsAgent = new HttpsProxyAgent(PROXY);
-                axiosConfig.proxy = false;
-            }
-
-            const response = await axios.get(currentUrl, axiosConfig);
-            if (response.status >= 300 && response.status < 400 && response.headers.location) {
-                currentUrl = response.headers.location;
-                // 如果重定向到非 Vertex 链接，说明解析完成
-                if (!currentUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect')) {
-                    return currentUrl;
-                }
-                continue;
-            }
-            return currentUrl;
-        } catch (error) {
-            if (error.response && error.response.status >= 300 && error.response.status < 400 && error.response.headers.location) {
-                currentUrl = error.response.headers.location;
-                if (!currentUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect')) {
-                    return currentUrl;
-                }
-                continue;
-            }
-            log(`解析重定向失败 (${currentUrl}): ${error.message}`);
-            return currentUrl;
+        if (PROXY) {
+            axiosConfig.httpsAgent = new HttpsProxyAgent(PROXY);
+            axiosConfig.proxy = false;
         }
+
+        const response = await axios.get(targetUrl, axiosConfig);
+
+        // 直接取最终 URL，这是 test.js 成功的关键
+        const finalUrl = response.request?.res?.responseUrl || targetUrl;
+        
+        if (finalUrl !== targetUrl && !finalUrl.includes('grounding-api-redirect')) {
+            log(`解析成功: ${targetUrl.substring(0, 40)}... -> ${finalUrl}`);
+            return finalUrl;
+        }
+
+        // 如果 responseUrl 没变，再尝试从 body 里捞一下（作为兜底）
+        const body = typeof response.data === 'string' ? response.data : '';
+        const metaMatch = body.match(/url=\s*([^"'\s>]+)/i);
+        if (metaMatch?.[1]) {
+            const resolved = metaMatch[1].replace(/&/g, '&').replace(/["']/g, '');
+            if (!resolved.includes('grounding-api-redirect')) {
+                return resolved;
+            }
+        }
+
+        return targetUrl;
+    } catch (error) {
+        // 报错时也尝试拿一下可能已经跳转的 URL
+        const fallbackUrl = error.request?.res?.responseUrl;
+        if (fallbackUrl && fallbackUrl !== targetUrl && !fallbackUrl.includes('grounding-api-redirect')) {
+            return fallbackUrl;
+        }
+
+        log(`解析失败: ${error.message}`);
+        return targetUrl;
     }
-    return currentUrl;
 };
 
 const callSearchModel = async (topic, keyword, showURL = false) => {
@@ -114,10 +122,10 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
         tool_choice: "auto",
         tools: [{
             type: "function",
-            function: { 
-                name: "googleSearch", 
-                description: "从谷歌搜索引擎获取实时信息。", 
-                parameters: { type: "object", properties: { query: { type: "string" } } } 
+            function: {
+                name: "googleSearch",
+                description: "从谷歌搜索引擎获取实时信息。",
+                parameters: { type: "object", properties: { query: { type: "string" } } }
             }
         }]
     };
@@ -129,26 +137,27 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
             timeout: 180000 // 3分钟超时
         });
         let content = response.data.choices[0].message.content;
-        
-        // 尝试解析 Gemini 的 grounding_metadata (引证来源)
-        if (showURL) {
-            try {
-                const metadata = response.data.choices[0].message.grounding_metadata || response.data.choices[0].grounding_metadata;
-                
-                // 1. 提取正文中所有可能的 Vertex 重定向 URL (包括没有协议头的)
-                const vertexUrlRegex = /(?:https?:\/\/)?vertexaisearch\.cloud\.google\.com\/grounding-api-redirect\/[a-zA-Z0-9_=-]+/g;
-                const foundUrls = content.match(vertexUrlRegex) || [];
-                
-                // 2. 提取 grounding_metadata 中的 URL
-                const metadataUrls = (metadata && metadata.grounding_chunks)
-                    ? metadata.grounding_chunks.filter(chunk => chunk.web).map(chunk => chunk.web.uri)
-                    : [];
 
-                // 合并并去重
-                const allVertexUrls = [...new Set([...foundUrls, ...metadataUrls])];
-                const urlMap = new Map();
+        // 尝试解析并替换 Vertex 代理 URL，无论 showURL 是什么，只要正文里有就提取并替换
+        try {
+            const metadata = response.data.choices[0].message?.grounding_metadata || response.data.choices[0]?.grounding_metadata;
 
-                // 并发解析所有发现的 URL
+            // 1. 提取正文中所有可能的 Vertex 重定向 URL (包括没有协议头的)
+            // 修复：[a-zA-Z0-9_=-] 中的 _=- 会被解释为无效范围，改为 [\w\-=]+
+            const vertexUrlRegex = /(?:https?:\/\/)?vertexaisearch\.cloud\.google\.com\/grounding-api-redirect\/[\w\-=]+/g;
+            const foundUrls = content.match(vertexUrlRegex) || [];
+
+            // 2. 提取 grounding_metadata 中的 URL
+            const metadataUrls = (metadata && metadata.grounding_chunks)
+                ? metadata.grounding_chunks.filter(chunk => chunk.web).map(chunk => chunk.web.uri)
+                : [];
+
+            // 合并并去重
+            const allVertexUrls = [...new Set([...foundUrls, ...metadataUrls])];
+            const urlMap = new Map();
+
+            // 并发解析所有发现的 URL
+            if (allVertexUrls.length > 0) {
                 await Promise.all(allVertexUrls.map(async (vUrl) => {
                     const realUrl = await resolveRedirect(vUrl);
                     if (realUrl !== vUrl) {
@@ -160,26 +169,26 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
                 for (const [original, resolved] of urlMap.entries()) {
                     content = content.split(original).join(resolved);
                 }
-
-                // 4. 构建引证来源列表 (如果 metadata 存在)
-                if (metadata && metadata.grounding_chunks) {
-                    const citations = metadata.grounding_chunks
-                        .map((chunk, index) => {
-                            if (chunk.web) {
-                                const realUrl = urlMap.get(chunk.web.uri) || chunk.web.uri;
-                                return `[cite: ${index + 1}] ${chunk.web.title}: ${realUrl}`;
-                            }
-                            return null;
-                        })
-                        .filter(c => c !== null);
-
-                    if (citations.length > 0) {
-                        content += `\n\n**API 自动引证来源 (已解析真实URL):**\n${citations.join('\n')}`;
-                    }
-                }
-            } catch (metaError) {
-                log(`解析引证元数据时出错: ${metaError.message}`);
             }
+
+            // 4. 构建引证来源列表 (仅在要求 showURL 时使用 metadata)
+            if (showURL && metadata && metadata.grounding_chunks) {
+                const citations = metadata.grounding_chunks
+                    .map((chunk, index) => {
+                        if (chunk.web) {
+                            const realUrl = urlMap.get(chunk.web.uri) || chunk.web.uri;
+                            return `[cite: ${index + 1}] ${chunk.web.title}: ${realUrl}`;
+                        }
+                        return null;
+                    })
+                    .filter(c => c !== null);
+
+                if (citations.length > 0) {
+                    content += `\n\n**API 自动引证来源 (已解析真实URL):**\n${citations.join('\n')}`;
+                }
+            }
+        } catch (metaError) {
+            log(`解析引证元数据/重定向URL时出错: ${metaError.message}`);
         }
 
         return content;
@@ -215,14 +224,14 @@ async function main(request) {
         const chunk = keywordList.slice(i, i + CONCURRENCY);
         const promises = chunk.map(kw => callSearchModel(SearchTopic, kw, showURL));
         const results = await Promise.all(promises);
-        
+
         results.forEach((res, idx) => {
             allResults.push(`### 关键词: ${chunk[idx]}\n${res}\n\n---\n\n`);
         });
     }
 
     const finalOutput = `## VSearch 检索报告\n\n**研究主题**: ${SearchTopic}\n\n${allResults.join('')}`;
-    
+
     sendResponse({ status: "success", result: finalOutput });
 }
 
