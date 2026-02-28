@@ -592,6 +592,19 @@ class ChatCompletionHandler {
 
       // 经过改造后，processedMessages 已经是最终版本，无需再调用 replaceOtherVariables
 
+      // 防御性处理：修复空 assistant 消息，避免上游 API 400 错误
+      // 某些模型（如 reasoning 模型）返回 content: null 时只有 tool_calls/thinking 字段
+      // 直接删除会打乱 user↔assistant 交替顺序，因此改为补充说明性内容
+      processedMessages = processedMessages.map(msg => {
+        if (msg.role === 'assistant') {
+          const content = msg.content;
+          if (content === null || content === undefined || (typeof content === 'string' && content.trim() === '') || (Array.isArray(content) && content.length === 0)) {
+            return { ...msg, content: '...' };
+          }
+        }
+        return msg;
+      });
+
       originalBody.messages = processedMessages;
       await writeDebugLog('LogOutputAfterProcessing', originalBody);
 

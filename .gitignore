@@ -210,3 +210,4 @@ Plugin/MagiAgent/meetings/magi-session-*.json
 VCPAsyncResults/MagiAgent-magi-session-*.json
 Plugin/IMAPIndex/mail_store/uid.index
 timeline/processed_files_db.json
+VCPTimedContacts/*.json

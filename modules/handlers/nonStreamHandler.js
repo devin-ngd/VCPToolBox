@@ -105,7 +105,9 @@ class NonStreamHandler {
 
         // 处理纯 Archery 且有错误的情况
         if (normalCalls.length === 0 && archeryErrorContents.length > 0) {
-          let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
+          // 防御性处理：确保 assistant 消息内容不为空（补充而非删除，保持消息顺序）
+          const safeContent1 = (!currentAIContentForLoop || (typeof currentAIContentForLoop === 'string' && currentAIContentForLoop.trim() === '')) ? '...' : currentAIContentForLoop;
+          let assistantMessages = [{ role: 'assistant', content: safeContent1 }];
           if (enableRoleDivider && enableRoleDividerInLoop) {
             assistantMessages = roleDivider.process(assistantMessages, {
               ignoreList: roleDividerIgnoreList,
@@ -115,17 +117,37 @@ class NonStreamHandler {
               skipCount: 0
             });
           }
+          assistantMessages = assistantMessages.map(msg => {
+            if (msg.role === 'assistant') {
+              const c = msg.content;
+              if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+                return { ...msg, content: '...' };
+              }
+            }
+            return msg;
+          });
           currentMessagesForNonStreamLoop.push(...assistantMessages);
 
           const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
           currentMessagesForNonStreamLoop.push({ role: 'user', content: errorPayload });
+
+          // 防御性处理：修复空 assistant 消息（补充而非删除，保持消息顺序）
+          const sanitizedMessages1 = currentMessagesForNonStreamLoop.map(msg => {
+            if (msg.role === 'assistant') {
+              const c = msg.content;
+              if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+                return { ...msg, content: '...' };
+              }
+            }
+            return msg;
+          });
 
           const recursionAiResponse = await fetchWithRetry(
             `${apiUrl}/v1/chat/completions`,
             {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-              body: JSON.stringify({ ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false }),
+              body: JSON.stringify({ ...originalBody, messages: sanitizedMessages1, stream: false }),
               signal: abortController.signal,
             },
             { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE }
@@ -155,7 +177,9 @@ class NonStreamHandler {
         if (normalCalls.length === 0) break;
 
         // 执行普通调用
-        let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
+        // 防御性处理：确保 assistant 消息内容不为空（补充而非删除，保持消息顺序）
+        const safeContent2 = (!currentAIContentForLoop || (typeof currentAIContentForLoop === 'string' && currentAIContentForLoop.trim() === '')) ? '...' : currentAIContentForLoop;
+        let assistantMessages = [{ role: 'assistant', content: safeContent2 }];
         if (enableRoleDivider && enableRoleDividerInLoop) {
           assistantMessages = roleDivider.process(assistantMessages, {
             ignoreList: roleDividerIgnoreList,
@@ -165,6 +189,15 @@ class NonStreamHandler {
             skipCount: 0
           });
         }
+        assistantMessages = assistantMessages.map(msg => {
+          if (msg.role === 'assistant') {
+            const c = msg.content;
+            if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+              return { ...msg, content: '...' };
+            }
+          }
+          return msg;
+        });
         currentMessagesForNonStreamLoop.push(...assistantMessages);
 
         const toolResults = await toolExecutor.executeAll(normalCalls, clientIp);
@@ -201,12 +234,23 @@ class NonStreamHandler {
 
         currentMessagesForNonStreamLoop.push({ role: 'user', content: finalToolPayloadForAI });
 
+        // 防御性处理：修复空 assistant 消息（补充而非删除，保持消息顺序）
+        const sanitizedMessages2 = currentMessagesForNonStreamLoop.map(msg => {
+          if (msg.role === 'assistant') {
+            const c = msg.content;
+            if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+              return { ...msg, content: '...' };
+            }
+          }
+          return msg;
+        });
+
         const recursionAiResponse = await fetchWithRetry(
           `${apiUrl}/v1/chat/completions`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify({ ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false }),
+            body: JSON.stringify({ ...originalBody, messages: sanitizedMessages2, stream: false }),
             signal: abortController.signal,
           },
           { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE }

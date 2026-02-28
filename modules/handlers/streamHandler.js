@@ -199,7 +199,10 @@ class StreamHandler {
         break;
       }
 
-      let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
+      // 防御性处理：确保 assistant 消息内容不为空，避免上游 API 400 错误
+      // 某些模型返回 content: null 时只有 reasoning/thinking 字段，补充说明性内容而非删除
+      const safeContentForLoop = (!currentAIContentForLoop || (typeof currentAIContentForLoop === 'string' && currentAIContentForLoop.trim() === '')) ? '...' : currentAIContentForLoop;
+      let assistantMessages = [{ role: 'assistant', content: safeContentForLoop }];
       if (enableRoleDivider && enableRoleDividerInLoop) {
         assistantMessages = roleDivider.process(assistantMessages, {
           ignoreList: roleDividerIgnoreList,
@@ -209,6 +212,16 @@ class StreamHandler {
           skipCount: 0
         });
       }
+      // 确保 roleDivider 处理后也没有空消息，补充而非删除
+      assistantMessages = assistantMessages.map(msg => {
+        if (msg.role === 'assistant') {
+          const c = msg.content;
+          if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+            return { ...msg, content: '...' };
+          }
+        }
+        return msg;
+      });
       currentMessagesForLoop.push(...assistantMessages);
 
       const toolCalls = ToolCallParser.parse(currentAIContentForLoop);
@@ -275,6 +288,17 @@ class StreamHandler {
           } catch (e) { }
         }
 
+        // 防御性处理：修复空 assistant 消息（补充而非删除，保持消息顺序）
+        const sanitizedMessages1 = currentMessagesForLoop.map(msg => {
+          if (msg.role === 'assistant') {
+            const c = msg.content;
+            if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+              return { ...msg, content: '...' };
+            }
+          }
+          return msg;
+        });
+
         const nextAiAPIResponse = await fetchWithRetry(
           `${apiUrl}/v1/chat/completions`,
           {
@@ -284,7 +308,7 @@ class StreamHandler {
               Authorization: `Bearer ${apiKey}`,
               Accept: 'text/event-stream',
             },
-            body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
+            body: JSON.stringify({ ...originalBody, messages: sanitizedMessages1, stream: true }),
             signal: abortController.signal,
           },
           { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE }
@@ -359,6 +383,17 @@ class StreamHandler {
         } catch (e) { }
       }
 
+      // 防御性处理：修复空 assistant 消息（补充而非删除，保持消息顺序）
+      const sanitizedMessages2 = currentMessagesForLoop.map(msg => {
+        if (msg.role === 'assistant') {
+          const c = msg.content;
+          if (c === null || c === undefined || (typeof c === 'string' && c.trim() === '') || (Array.isArray(c) && c.length === 0)) {
+            return { ...msg, content: '...' };
+          }
+        }
+        return msg;
+      });
+
       const nextAiAPIResponse = await fetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
@@ -368,7 +403,7 @@ class StreamHandler {
             Authorization: `Bearer ${apiKey}`,
             Accept: 'text/event-stream',
           },
-          body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
+          body: JSON.stringify({ ...originalBody, messages: sanitizedMessages2, stream: true }),
           signal: abortController.signal,
         },
         { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE }
