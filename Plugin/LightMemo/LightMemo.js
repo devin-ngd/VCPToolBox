@@ -157,6 +157,41 @@ class LightMemoPlugin {
             actualQuery = actualQuery.replace('[音乐检索]', '').trim();
         }
 
+        // --- 时间范围约束语法解析 ---
+        let timeRange = null;
+        const timeRangeRegex = /\[\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*[~到-]\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*\]/;
+        let timeMatch = actualQuery.match(timeRangeRegex);
+
+        const parseDateToNumber = (dateStr, isEnd) => {
+            const parts = dateStr.split(/[-./]/);
+            const y = parts[0];
+            const m = (parts[1] || (isEnd ? '12' : '01')).padStart(2, '0');
+            const d = (parts[2] || (isEnd ? '31' : '01')).padStart(2, '0');
+            return parseInt(`${y}${m}${d}`, 10);
+        };
+
+        if (timeMatch) {
+            const startNum = parseDateToNumber(timeMatch[1], false);
+            const endNum = parseDateToNumber(timeMatch[2], true);
+            timeRange = { start: startNum, end: endNum };
+            actualQuery = actualQuery.replace(timeMatch[0], '').trim();
+            console.log(`[LightMemo] Parsed time range constraint: ${timeMatch[1]} to ${timeMatch[2]} (${startNum} - ${endNum})`);
+        } else {
+            const singleDateRegex = /\[\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*\]/;
+            const singleDateMatch = actualQuery.match(singleDateRegex);
+            if (singleDateMatch) {
+                const dateNumStart = parseDateToNumber(singleDateMatch[1], false);
+                const dateNumEnd = parseDateToNumber(singleDateMatch[1], true);
+                timeRange = { start: dateNumStart, end: dateNumEnd };
+                actualQuery = actualQuery.replace(singleDateMatch[0], '').trim();
+                console.log(`[LightMemo] Parsed single date constraint: ${singleDateMatch[1]} (${dateNumStart} - ${dateNumEnd})`);
+            }
+        }
+
+        if (!actualQuery && timeRange) {
+            actualQuery = maid || folder || "记录"; // 如果只有时间约束，给予默认查询词避免向量化报错
+        }
+
         if (!isMusicSearch && (!query || (!maid && !folder))) {
             throw new Error("参数 'query' 是必需的，且必须提供 'maid' 或 'folder'。");
         }
@@ -170,7 +205,8 @@ class LightMemoPlugin {
             maid: effectiveMaid,
             folder: effectiveFolder,
             searchAll: effectiveSearchAll,
-            ignoreExcludedFolders: isMusicSearch
+            ignoreExcludedFolders: isMusicSearch,
+            timeRange: timeRange
         });
 
         if (candidates.length === 0) {
@@ -240,7 +276,7 @@ class LightMemoPlugin {
         // 🚀【新步骤】如果启用了 TagMemo，则调用 KBM 的功能来增强向量
         if (tag_boost > 0 && this.vectorDBManager && typeof this.vectorDBManager.applyTagBoost === 'function') {
             const hasCore = Array.isArray(core_tags) && core_tags.length > 0;
-            console.log(`[LightMemo] Applying TagMemo V3 boost (Factor: ${tag_boost}${hasCore ? `, CoreTags: ${core_tags.length}` : ''})`);
+            console.log(`[LightMemo] Applying TagMemo V6 boost (Factor: ${tag_boost}${hasCore ? `, CoreTags: ${core_tags.length}` : ''})`);
 
             // 即使 core_tags 为空，KBM 内部也会处理好默认逻辑
             const boostResult = this.vectorDBManager.applyTagBoost(
@@ -258,10 +294,10 @@ class LightMemoPlugin {
                     const matched = tagBoostInfo.matchedTags || [];
                     const coreMatched = tagBoostInfo.coreTagsMatched || [];
                     if (coreMatched.length > 0) {
-                        console.log(`[LightMemo] TagMemo V3 Spotlight: [${coreMatched.join(', ')}]`);
+                        console.log(`[LightMemo] TagMemo V6 Spotlight: [${coreMatched.join(', ')}]`);
                     }
                     if (matched.length > 0) {
-                        console.log(`[LightMemo] TagMemo V3 Matched: [${matched.slice(0, 5).join(', ')}]`);
+                        console.log(`[LightMemo] TagMemo V6 Matched: [${matched.slice(0, 5).join(', ')}]`);
                     }
                 }
             }
@@ -522,7 +558,7 @@ class LightMemoPlugin {
      * 从所有相关日记本中收集chunks（带署名过滤）
      * 适配 KnowledgeBaseManager (SQLite)
      */
-    async _gatherCandidateChunks({ maid, folder, searchAll, ignoreExcludedFolders = false }) {
+    async _gatherCandidateChunks({ maid, folder, searchAll, ignoreExcludedFolders = false, timeRange = null }) {
         const db = this.vectorDBManager.db;
         if (!db) {
             console.error('[LightMemo] Database not initialized in KnowledgeBaseManager.');
@@ -570,6 +606,24 @@ class LightMemoPlugin {
             // 流式遍历过滤后的 chunks
             for (const row of stmt.iterate(...params)) {
                 const text = row.content || '';
+
+                // --- 2.5 时间范围过滤 ---
+                if (timeRange) {
+                    const header = text.substring(0, 100);
+                    const chunkTimeMatch = header.match(/\[?(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\]?/);
+                    if (!chunkTimeMatch) {
+                        continue; // 无时间戳，被时间约束丢弃
+                    }
+                    const parts = chunkTimeMatch[1].split(/[-./]/);
+                    const y = parts[0];
+                    const m = (parts[1] || '01').padStart(2, '0');
+                    const d = (parts[2] || '01').padStart(2, '0');
+                    const chunkDateNum = parseInt(`${y}${m}${d}`, 10);
+
+                    if (chunkDateNum < timeRange.start || chunkDateNum > timeRange.end) {
+                        continue;
+                    }
+                }
 
                 // 3. 署名过滤 (如果不是搜索全部且没有指定文件夹)
                 if (!searchAll && targetFolders.length === 0 && maid) {

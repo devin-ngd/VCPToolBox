@@ -403,6 +403,10 @@
                 <span class="server-title">VCPToolBox</span>
             </div>
             <div class="header-actions">
+                <button id="animation-toggle-button" class="theme-button">
+                    <span class="material-symbols-outlined">animation</span>
+                    关闭动画
+                </button>
                 <button id="restart-server-button" class="restart-button">
                     <span class="material-symbols-outlined">restart_alt</span>
                     重启服务器
@@ -442,6 +446,8 @@
                                 class="material-symbols-outlined">smart_toy</span>Agent管理器</a></li>
                     <li><a href="#" data-target="agent-assistant-config"><span
                                 class="material-symbols-outlined">diversity_3</span>Agent助手配置</a></li>
+                    <li><a href="#" data-target="agent-scores"><span
+                                class="material-symbols-outlined">leaderboard</span>Agent积分排行榜</a></li>
                     <li><a href="#" data-target="tvs-files-editor"><span
                                 class="material-symbols-outlined">data_object</span>高级变量编辑器</a></li>
                     <li><a href="#" data-target="tool-list-editor"><span
@@ -760,6 +766,38 @@
                 </div>
             </section>
 
+            <section id="agent-scores-section" class="config-section">
+                <h2>Agent 积分排行榜</h2>
+                <p class="description">在这里查看 Agent 的积分情况。完成异步委托任务或其他系统贡献将自动获得积分奖励。</p>
+                <div class="agent-scores-container card">
+                    <div class="scores-header">
+                        <button id="refresh-scores-button" class="btn-secondary">
+                            <span class="material-symbols-outlined">refresh</span> 刷新数据
+                        </button>
+                        <span id="scores-status" class="status-message"></span>
+                    </div>
+                    <div class="table-container">
+                        <table class="modern-table" id="agent-scores-table">
+                            <thead>
+                                <tr>
+                                    <th>排名</th>
+                                    <th>执行者 (Agent)</th>
+                                    <th>总积分</th>
+                                    <th>最近动态</th>
+                                    <th>获取时间</th>
+                                </tr>
+                            </thead>
+                            <tbody id="agent-scores-body">
+                                <!-- Data will be loaded here -->
+                                <tr>
+                                    <td colspan="5" style="text-align: center; padding: 40px; opacity: 0.6;">正在加载积分数据...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
             <section id="tvs-files-editor-section" class="config-section">
                 <h2>高级变量编辑器 (.txt)</h2>
                 <div class="tvs-editor-controls">
@@ -787,7 +825,8 @@
                         <option value="">全部类型</option>
                     </select>
                     <label for="placeholder-filter-keyword">关键字：</label>
-                    <input type="text" id="placeholder-filter-keyword" class="placeholder-filter-input" placeholder="搜索占位符名称或预览…">
+                    <input type="text" id="placeholder-filter-keyword" class="placeholder-filter-input"
+                        placeholder="搜索占位符名称或预览…">
                 </div>
                 <div id="placeholder-viewer-list" class="placeholder-viewer-list">
                     <!-- 占位符列表由 placeholder-viewer.js 渲染 -->
@@ -797,17 +836,24 @@
                     <div class="placeholder-detail-modal-content">
                         <div class="placeholder-detail-modal-header">
                             <h3 id="placeholder-detail-title"></h3>
-                            <button type="button" class="placeholder-detail-modal-close" aria-label="关闭">&times;</button>
+                            <button type="button" class="placeholder-detail-modal-close"
+                                aria-label="关闭">&times;</button>
                         </div>
                         <div class="placeholder-detail-tabs" role="tablist">
-                            <button type="button" class="placeholder-detail-tab active" role="tab" aria-selected="true" data-tab="raw">原始文本</button>
-                            <button type="button" class="placeholder-detail-tab" role="tab" aria-selected="false" data-tab="markdown">Markdown 渲染</button>
-                            <button type="button" class="placeholder-detail-tab" role="tab" aria-selected="false" data-tab="json">JSON 格式化</button>
+                            <button type="button" class="placeholder-detail-tab active" role="tab" aria-selected="true"
+                                data-tab="raw">原始文本</button>
+                            <button type="button" class="placeholder-detail-tab" role="tab" aria-selected="false"
+                                data-tab="markdown">Markdown 渲染</button>
+                            <button type="button" class="placeholder-detail-tab" role="tab" aria-selected="false"
+                                data-tab="json">JSON 格式化</button>
                         </div>
                         <div id="placeholder-detail-body" class="placeholder-detail-modal-body">
-                            <div id="placeholder-detail-panel-raw" class="placeholder-detail-panel active" role="tabpanel"></div>
-                            <div id="placeholder-detail-panel-markdown" class="placeholder-detail-panel" role="tabpanel"></div>
-                            <div id="placeholder-detail-panel-json" class="placeholder-detail-panel" role="tabpanel"></div>
+                            <div id="placeholder-detail-panel-raw" class="placeholder-detail-panel active"
+                                role="tabpanel"></div>
+                            <div id="placeholder-detail-panel-markdown" class="placeholder-detail-panel"
+                                role="tabpanel"></div>
+                            <div id="placeholder-detail-panel-json" class="placeholder-detail-panel" role="tabpanel">
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1295,6 +1341,10 @@
                 }
 
                 function animate() {
+                    if (canvas.style.display === 'none') {
+                        requestAnimationFrame(animate);
+                        return;
+                    }
                     ctx.clearRect(0, 0, width, height);
                     particles.forEach(p => {
                         p.update();
@@ -1359,6 +1409,45 @@
                 animate();
             }
         });
+
+        // --- 动画开关逻辑 ---
+        const animationToggleButton = document.getElementById('animation-toggle-button');
+        let animationsEnabled = localStorage.getItem('animationsEnabled') !== 'false';
+
+        function applyAnimationsState(enabled) {
+            animationsEnabled = enabled;
+            localStorage.setItem('animationsEnabled', enabled);
+
+            const solarSystemBg = document.querySelector('.solar-system-bg');
+            if (solarSystemBg) {
+                solarSystemBg.style.display = enabled ? '' : 'none';
+            }
+
+            const canvas = document.getElementById('vcp-animation-canvas');
+            if (canvas) {
+                canvas.style.display = enabled ? '' : 'none';
+            }
+
+            const logo = document.getElementById('vcp-logo-main');
+            if (logo) {
+                logo.style.animation = enabled ? '' : 'none';
+                logo.style.filter = enabled ? '' : 'drop-shadow(0 0 4px var(--highlight-text))';
+            }
+
+            if (animationToggleButton) {
+                animationToggleButton.innerHTML = enabled ?
+                    '<span class="material-symbols-outlined">animation</span>关闭动画' :
+                    '<span class="material-symbols-outlined">animation</span>开启动画';
+            }
+        }
+
+        if (animationToggleButton) {
+            animationToggleButton.addEventListener('click', () => {
+                applyAnimationsState(!animationsEnabled);
+            });
+        }
+
+        applyAnimationsState(animationsEnabled);
 
         // 移动端菜单切换逻辑
         const mobileMenuToggle = document.getElementById('mobile-menu-toggle');
