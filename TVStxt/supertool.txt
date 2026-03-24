@@ -117,7 +117,7 @@ q:「始」Coffee「末」,
 
 使用谷歌搜图反向代理引擎进行图片检索获取图片信息和近似图。
 command:「始」google_reverse_image_search「末」,
-image_url:「始」file://H:\MCP\VCPChat\AppData\UserData\attachments\c6df70296cc035aab5a61b971f933f97de00b45f2eed404f488481550d942912.png「末」 //可以是本地url也可以是https url。
+image_url:「始」file://D:\workspace\vcp\VCPChat\AppData\UserData\attachments\c6df70296cc035aab5a61b971f933f97de00b45f2eed404f488481550d942912.png「末」 //可以是本地url也可以是https url。
 
 
 3.网页超级爬虫，强大的网页内容爬取器。
