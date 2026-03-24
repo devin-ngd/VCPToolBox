@@ -444,6 +444,8 @@
                                 class="material-symbols-outlined">casino</span>VCPTavern预设编辑</a></li>
                     <li><a href="#" data-target="agent-files-editor"><span
                                 class="material-symbols-outlined">smart_toy</span>Agent管理器</a></li>
+                    <li><a href="#" data-target="toolbox-manager"><span
+                                class="material-symbols-outlined">inventory_2</span>Toolbox管理器</a></li>
                     <li><a href="#" data-target="agent-assistant-config"><span
                                 class="material-symbols-outlined">diversity_3</span>Agent助手配置</a></li>
                     <li><a href="#" data-target="agent-scores"><span
@@ -454,6 +456,8 @@
                                 class="material-symbols-outlined">construction</span>工具列表配置编辑器</a></li>
                     <li><a href="#" data-target="preprocessor-order-manager"><span
                                 class="material-symbols-outlined">sort</span>预处理器顺序管理</a></li>
+                    <li><a href="#" data-target="tool-approval-manager"><span
+                                class="material-symbols-outlined">verified_user</span>插件调用审核管理</a></li>
                     <li><a href="#" data-target="thinking-chains-editor"><span
                                 class="material-symbols-outlined">psychology</span>思维链编辑器</a></li>
                     <li><a href="#" data-target="schedule-manager"><span
@@ -564,6 +568,14 @@
                         <h3>日程概览</h3>
                         <div id="dashboard-calendar-widget" class="calendar-widget">
                             <!-- 日历挂件将动态加载到这里 -->
+                        </div>
+                    </div>
+                    <div class="status-card news-card">
+                        <h3>滚动新闻</h3>
+                        <div class="news-container">
+                            <div id="news-scroller" class="news-scroller">
+                                <p style="text-align: center; padding: 20px; opacity: 0.6;">正在加载实时热点...</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -697,6 +709,35 @@
                 </div>
             </section>
 
+            <section id="toolbox-manager-section" class="config-section">
+                <h2>Toolbox 管理器</h2>
+                <p class="description">维护 toolbox_map.json（alias→file+description），并编辑 TVStxt 下映射文件内容。</p>
+                <div class="agent-manager-container">
+                    <div class="agent-map-editor">
+                        <h3>Toolbox 映射表</h3>
+                        <div class="agent-map-controls">
+                            <button id="add-toolbox-map-entry-button">添加新 Toolbox</button>
+                            <button id="create-toolbox-file-button">新建 Toolbox 文件</button>
+                            <button id="save-toolbox-map-button">保存 Toolbox 映射表</button>
+                            <span id="toolbox-map-status" class="status-message"></span>
+                        </div>
+                        <div id="toolbox-map-list">
+                            <!-- Toolbox map entries will be dynamically loaded here -->
+                        </div>
+                    </div>
+                    <div class="agent-file-editor">
+                        <h3>Toolbox 文件内容 (.txt/.md)</h3>
+                        <div class="agent-editor-controls">
+                            <span id="editing-toolbox-file-display">未选择文件</span>
+                            <button id="save-toolbox-file-button" disabled>保存文件</button>
+                            <span id="toolbox-file-status" class="status-message"></span>
+                        </div>
+                        <textarea id="toolbox-file-content-editor" spellcheck="false"
+                            placeholder="从左侧选择一个 Toolbox 以编辑其关联文件..."></textarea>
+                    </div>
+                </div>
+            </section>
+
             <section id="agent-assistant-config-section" class="config-section">
                 <h2>Agent 助手配置（AgentAssistant）</h2>
                 <p class="description">
@@ -763,6 +804,44 @@
                         <button id="aa-save-config-button" type="button">保存 AgentAssistant 配置</button>
                         <span id="aa-status" class="status-message"></span>
                     </div>
+                </div>
+            </section>
+
+            <section id="tool-approval-manager-section" class="config-section">
+                <h2>插件调用审核管理</h2>
+                <p class="description">在此管理工具调用的审核机制。开启后，特定的工具调用将需要通过管理面板进行人工确认。</p>
+                <div class="card">
+                    <form id="tool-approval-config-form">
+                        <div class="config-item">
+                            <label class="switch-container">
+                                <span>是否开启工具调用审核</span>
+                                <input type="checkbox" id="tool-approval-enabled">
+                                <span class="switch-slider"></span>
+                            </label>
+                        </div>
+                        <div class="config-item">
+                            <label class="switch-container">
+                                <span>是否开启所有工具调用审核</span>
+                                <input type="checkbox" id="tool-approval-approve-all">
+                                <span class="switch-slider"></span>
+                            </label>
+                            <p class="aa-hint">如果开启，所有工具调用都将进入审核流程，无论是否在名单中。</p>
+                        </div>
+                        <div class="config-item">
+                            <label for="tool-approval-timeout">设置审核最大等待时间 (分钟)</label>
+                            <input type="number" id="tool-approval-timeout" min="1" max="60" value="5">
+                            <p class="aa-hint">超时后，该审核请求将自动拒绝。</p>
+                        </div>
+                        <div class="config-item">
+                            <label for="tool-approval-list">被审核工具名单 (每行一个工具名称)</label>
+                            <textarea id="tool-approval-list" rows="8" placeholder="例如：\nSciCalculator\nPowerShellExecutor"></textarea>
+                            <p class="aa-hint">当“开启所有工具调用审核”关闭时，仅对此名单中的工具进行审核。</p>
+                        </div>
+                        <div class="config-footer">
+                            <button type="submit" class="btn-primary">保存审核配置</button>
+                            <span id="tool-approval-status" class="status-message"></span>
+                        </div>
+                    </form>
                 </div>
             </section>
 
@@ -867,6 +946,10 @@
                         <input type="text" id="server-log-filter" placeholder="🔍 过滤日志内容...">
                         <span id="server-log-line-count">0 行</span>
                         <span id="server-log-status" class="status-message info">就绪</span>
+                        <div class="log-limit-controls" style="display: flex; align-items: center; gap: 8px;">
+                            <label for="server-log-limit" style="font-size: 0.9em; opacity: 0.8;">行数限制:</label>
+                            <input type="number" id="server-log-limit" min="100" max="100000" value="5000" style="width: 80px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--input-bg); color: var(--primary-text); font-size: 0.9em;">
+                        </div>
                         <button id="reverse-server-log-button" class="btn-secondary">🔃 倒序显示</button>
                         <button id="copy-server-log-button" class="btn-secondary">📋 复制</button>
                         <button id="clear-server-log-button" class="btn-secondary">🗑️ 清空</button>
@@ -1274,6 +1357,45 @@
     <div id="message-popup" class="message-popup"></div>
 
     <script type="module" src="script.js"></script>
+    <!-- Associative Discovery Modal -->
+    <div id="associative-discovery-modal" class="placeholder-detail-modal">
+        <div class="placeholder-detail-modal-backdrop" id="discovery-modal-backdrop"></div>
+        <div class="placeholder-detail-modal-content" style="max-width: 800px;">
+            <div class="placeholder-detail-modal-header">
+                <h3 id="discovery-modal-title">联想追溯: </h3>
+                <button class="placeholder-detail-modal-close" id="close-discovery-modal">&times;</button>
+            </div>
+            <div class="placeholder-detail-modal-body">
+                <div class="discovery-config-panel">
+                    <div class="config-row">
+                        <label for="discovery-k-slider">联想深度 (K=50):</label>
+                        <input type="range" id="discovery-k-slider" min="5" max="100" step="5" value="50">
+                        <span id="discovery-k-display">50</span>
+                    </div>
+                    <div class="config-row">
+                        <label>联想范围 (不选则为全局):</label>
+                        <div id="discovery-range-chips" class="folder-chips-container">
+                            <!-- 文件夹芯片将动态加载 -->
+                        </div>
+                    </div>
+                    <div class="config-actions">
+                        <button id="start-discovery-btn" class="primary-btn">开始联想</button>
+                    </div>
+                </div>
+                <div id="discovery-results-area" class="discovery-results-area">
+                    <div id="discovery-loader" class="loader-container" style="display: none;">
+                        <div class="vcp-spinner"></div>
+                        <p>正在跨维度连接语义节点...</p>
+                    </div>
+                    <div id="discovery-warning" class="status-message warning" style="display: none;"></div>
+                    <div id="discovery-results-list" class="discovery-results-list">
+                        <!-- 结果将动态加载 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             const canvas = document.getElementById('vcp-animation-canvas');

@@ -6,6 +6,7 @@ import { initializeDashboard, stopDashboardUpdates } from './js/dashboard.js';
 import { initializeDailyNotesManager } from './js/notes-manager.js';
 import { initializeAgentManager } from './js/agent-manager.js';
 import { initializeAgentAssistantConfig } from './js/agent-assistant-config.js';
+import { initializeToolboxManager } from './js/toolbox-manager.js';
 import { initializeTvsFilesEditor } from './js/tvs-editor.js';
 import { initializeServerLogViewer, stopServerLogUpdates } from './js/log-viewer.js';
 import { initializePreprocessorOrderManager } from './js/preprocessor-manager.js';
@@ -17,6 +18,7 @@ import { initializeRAGTuning } from './js/rag-tuning.js';
 import { initializeDreamManager } from './js/dream-manager.js';
 import { initializeAgentScores } from './js/agent-scores.js';
 import { initializePlaceholderViewer } from './js/placeholder-viewer.js';
+import { initializeToolApprovalManager } from './js/tool-approval.js';
 
 document.addEventListener('DOMContentLoaded', async () => {
     // 1. 通过后端验证登录状态（替代前端 Cookie 检查，解决 HttpOnly 无法读取问题）
@@ -130,6 +132,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     case 'agent-scores-section':
                         initializeAgentScores();
                         break;
+                    case 'toolbox-manager-section':
+                        initializeToolboxManager();
+                        break;
                     case 'tvs-files-editor-section':
                         initializeTvsFilesEditor();
                         break;
@@ -159,6 +164,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                         break;
                     case 'placeholder-viewer-section':
                         initializePlaceholderViewer();
+                        break;
+                    case 'tool-approval-manager-section':
+                        initializeToolApprovalManager();
                         break;
                 }
             }

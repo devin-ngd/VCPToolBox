@@ -4,6 +4,7 @@ const path = require('path');
 const lunarCalendar = require('chinese-lunar-calendar');
 const agentManager = require('./agentManager.js'); // 引入新的Agent管理器
 const tvsManager = require('./tvsManager.js'); // 引入新的TVS管理器
+const toolboxManager = require('./toolboxManager.js');
 
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || 'Asia/Shanghai'; // 新增：用于控制 AI 报告的时间，默认回退到中国时区
@@ -35,36 +36,109 @@ async function resolveAllVariables(text, model, role, context, processingStack =
     if (text == null) return '';
     let processedText = String(text);
 
+    // 🔒 安全防护：Agent 和 Toolbox 占位符仅在特权角色中展开
+    // 特权角色包括：1) 标准 system 消息  2) VCPTavern 注入的以 [系统提示:] / [系统邀请指令:] 开头的 user 消息
+    // 防止用户在普通 user/assistant 消息中通过 {{agent:XXX}} 注入来读取 Agent prompt 或触发意外展开
+    const isPrivilegedRole = (role === 'system') || (role === 'user' && (processedText.startsWith('[系统提示:]') || processedText.startsWith('[系统邀请指令:]')));
+
     // 通用正则表达式，匹配所有 {{...}} 格式的占位符
-    const placeholderRegex = /\{\{([a-zA-Z0-9_:]+)\}\}/g;
+    // CJK Radicals Supplement - Ideographic Description Characters 0x2E80 - 0x2FFF
+    // Hiragana - CJK Unified Ideographs 0x3040 - 0x9FFF
+    // 跳过标点符号 CJK Symbols and Punctuation 0x3000 - 0x303F
+    const placeholderRegex = /\{\{([a-zA-Z0-9_:\u2e80-\u2fff\u3040-\u9fff]+)\}\}/g;
     const matches = [...processedText.matchAll(placeholderRegex)];
 
-    // 提取所有潜在的别名（去除 "agent:" 前缀）
-    const allAliases = new Set(matches.map(match => match[1].replace(/^agent:/, '')));
+    // 提取所有潜在的别名（去除 "agent:" / "toolbox:" 前缀）
+    const allAliases = new Set(matches.map(match => match[1].replace(/^(agent:|toolbox:)/, '')));
 
-    for (const alias of allAliases) {
-        // 关键：使用 agentManager 来判断这是否是一个真正的Agent
-        if (agentManager.isAgent(alias)) {
-            if (processingStack.has(alias)) {
-                console.error(`[AgentManager] Circular dependency detected! Stack: [${[...processingStack].join(' -> ')} -> ${alias}]`);
-                const errorMessage = `[Error: Circular agent reference detected for '${alias}']`;
-                processedText = processedText.replaceAll(`{{${alias}}}`, errorMessage).replaceAll(`{{agent:${alias}}}`, errorMessage);
-                continue;
+    if (isPrivilegedRole) {
+        for (const alias of allAliases) {
+            // 关键：使用 agentManager 来判断这是否是一个真正的Agent
+            if (agentManager.isAgent(alias)) {
+                // 🔒 灵魂级安全：Agent 占位符在整个上下文中只允许展开一个
+                // 如果已有其他 Agent 被展开，当前 Agent 占位符静默移除（替换为空串）
+                if (context.expandedAgentName !== undefined && context.expandedAgentName !== null) {
+                    if (context.expandedAgentName !== alias) {
+                        // 已有不同的 Agent 被展开，静默移除当前占位符
+                        if (context.DEBUG_MODE) {
+                            console.log(`[AgentGuard] Agent '${alias}' 被拒绝展开：上下文中已展开 '${context.expandedAgentName}'，仅允许一个 Agent`);
+                        }
+                        processedText = processedText.replaceAll(`{{${alias}}}`, '').replaceAll(`{{agent:${alias}}}`, '');
+                        continue;
+                    }
+                    // 同名 Agent 在后续消息中重复出现，也静默移除（首次已展开）
+                    processedText = processedText.replaceAll(`{{${alias}}}`, '').replaceAll(`{{agent:${alias}}}`, '');
+                    continue;
+                }
+
+                if (processingStack.has(alias)) {
+                    console.error(`[AgentManager] Circular dependency detected! Stack: [${[...processingStack].join(' -> ')} -> ${alias}]`);
+                    const errorMessage = `[Error: Circular agent reference detected for '${alias}']`;
+                    processedText = processedText.replaceAll(`{{${alias}}}`, errorMessage).replaceAll(`{{agent:${alias}}}`, errorMessage);
+                    continue;
+                }
+
+                const agentContent = await agentManager.getAgentPrompt(alias);
+
+                processingStack.add(alias);
+                const resolvedAgentContent = await resolveAllVariables(agentContent, model, role, context, processingStack);
+                processingStack.delete(alias);
+
+                // 替换两种可能的Agent占位符格式
+                processedText = processedText.replaceAll(`{{${alias}}}`, resolvedAgentContent);
+                processedText = processedText.replaceAll(`{{agent:${alias}}}`, resolvedAgentContent);
+
+                // 标记此 Agent 已被展开，后续消息中的任何 Agent 占位符都将被忽略
+                context.expandedAgentName = alias;
             }
+        }
 
-            const agentContent = await agentManager.getAgentPrompt(alias);
+        // 在所有Agent都被递归展开后，处理 toolbox 占位符
+        for (const alias of allAliases) {
+            if (toolboxManager.isToolbox(alias)) {
+                // 🔒 Toolbox 去重：每种 toolbox 在整个上下文中只展开一次
+                // 同名 toolbox 在后续消息中重复出现时静默移除
+                if (context.expandedToolboxes && context.expandedToolboxes.has(alias)) {
+                    if (context.DEBUG_MODE) {
+                        console.log(`[ToolboxGuard] Toolbox '${alias}' 已在之前的消息中展开，跳过重复展开`);
+                    }
+                    processedText = processedText
+                        .replaceAll(`{{${alias}}}`, '')
+                        .replaceAll(`{{toolbox:${alias}}}`, '');
+                    continue;
+                }
 
-            processingStack.add(alias);
-            const resolvedAgentContent = await resolveAllVariables(agentContent, model, role, context, processingStack);
-            processingStack.delete(alias);
+                const stackKey = `toolbox:${alias}`;
+                if (processingStack.has(stackKey)) {
+                    const errorMessage = `[Error: Circular toolbox reference detected for '${alias}']`;
+                    processedText = processedText
+                        .replaceAll(`{{${alias}}}`, errorMessage)
+                        .replaceAll(`{{toolbox:${alias}}}`, errorMessage);
+                    continue;
+                }
 
-            // 替换两种可能的Agent占位符格式
-            processedText = processedText.replaceAll(`{{${alias}}}`, resolvedAgentContent);
-            processedText = processedText.replaceAll(`{{agent:${alias}}}`, resolvedAgentContent);
+                processingStack.add(stackKey);
+                const foldObj = await toolboxManager.getFoldObject(alias);
+                const expandedText = await resolveDynamicFoldProtocol(
+                    foldObj,
+                    context,
+                    `{{${alias}}}`
+                );
+                processingStack.delete(stackKey);
+
+                processedText = processedText
+                    .replaceAll(`{{${alias}}}`, expandedText)
+                    .replaceAll(`{{toolbox:${alias}}}`, expandedText);
+
+                // 标记此 Toolbox 已展开
+                if (context.expandedToolboxes) {
+                    context.expandedToolboxes.add(alias);
+                }
+            }
         }
     }
 
-    // 在所有Agent都被递归展开后，处理剩余的非Agent占位符
+    // 处理剩余的非Agent占位符
     processedText = await replacePriorityVariables(processedText, context, role);
     processedText = await replaceOtherVariables(processedText, model, role, context);
 
@@ -123,35 +197,49 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
             return fallbackBlock.content;
         }
 
-        // 调用 RAGDiaryPlugin 的清理方法，确保文本与 RAG 插件完全一致 (命中缓存的关键)
-        if (typeof ragPlugin._stripSystemNotification === 'function') {
+        // 调用 RAGDiaryPlugin 的统一净化方法，确保文本与 RAG 插件完全一致 (命中缓存的关键)
+        if (typeof ragPlugin.sanitizeForEmbedding === 'function') {
             if (userContent) {
                 const originalUserContent = userContent;
-                userContent = ragPlugin._stripSystemNotification(userContent);
-                userContent = ragPlugin._stripHtml(userContent);
-                userContent = ragPlugin._stripEmoji(userContent);
-                userContent = ragPlugin._stripToolMarkers(userContent);
+                userContent = ragPlugin.sanitizeForEmbedding(userContent, 'user');
                 if (context.DEBUG_MODE && originalUserContent.length !== userContent.length) {
-                    console.log('[DynamicFold] User content was sanitized (SystemNotification + HTML + Emoji removed).');
+                    console.log('[DynamicFold] User content was sanitized via unified sanitizer.');
                 }
             }
-        }
-        if (aiContent && typeof ragPlugin._stripHtml === 'function') {
-            const originalAiContent = aiContent;
-            aiContent = ragPlugin._stripHtml(aiContent);
-            aiContent = ragPlugin._stripEmoji(aiContent);
-            aiContent = ragPlugin._stripToolMarkers(aiContent);
-            if (context.DEBUG_MODE && originalAiContent.length !== aiContent.length) {
-                console.log('[DynamicFold] AI content was sanitized (HTML + Emoji removed).');
+            if (aiContent) {
+                const originalAiContent = aiContent;
+                aiContent = ragPlugin.sanitizeForEmbedding(aiContent, 'assistant');
+                if (context.DEBUG_MODE && originalAiContent.length !== aiContent.length) {
+                    console.log('[DynamicFold] AI content was sanitized via unified sanitizer.');
+                }
+            }
+        } else {
+            // 后备逻辑：如果插件版本较旧，尝试使用旧的私有方法
+            if (typeof ragPlugin._stripSystemNotification === 'function') {
+                if (userContent) {
+                    userContent = ragPlugin._stripSystemNotification(userContent);
+                    userContent = ragPlugin._stripHtml(userContent);
+                    userContent = ragPlugin._stripEmoji(userContent);
+                    userContent = ragPlugin._stripToolMarkers(userContent);
+                }
+            }
+            if (aiContent && typeof ragPlugin._stripHtml === 'function') {
+                aiContent = ragPlugin._stripHtml(aiContent);
+                aiContent = ragPlugin._stripEmoji(aiContent);
+                aiContent = ragPlugin._stripToolMarkers(aiContent);
             }
         }
 
-        const combinedQueryForDisplay = aiContent
-            ? `[AI]: ${aiContent}\n[User]: ${userContent}`
-            : userContent;
+        // 🌟 对齐 RAGDiaryPlugin 的加权平均逻辑以命中缓存
+        const config = ragPlugin.ragParams?.RAGDiaryPlugin || {};
+        const mainWeights = config.mainSearchWeights || [0.7, 0.3];
 
-        // 获取当前会话上下文向量 (此时将完美命中 RAGDiaryPlugin 的 embeddingCache)
-        const userVector = await ragPlugin.getSingleEmbeddingCached(combinedQueryForDisplay);
+        const [uVec, aVec] = await Promise.all([
+            userContent ? ragPlugin.getSingleEmbeddingCached(userContent) : Promise.resolve(null),
+            aiContent ? ragPlugin.getSingleEmbeddingCached(aiContent) : Promise.resolve(null)
+        ]);
+
+        const userVector = ragPlugin._getWeightedAverageVector([uVec, aVec], mainWeights);
         if (!userVector) {
             if (context.DEBUG_MODE) console.log(`[DynamicFold] 获取用户上下文向量失败，返回基础内容 (${placeholderKey})`);
             return fallbackBlock.content;
@@ -214,7 +302,7 @@ async function replaceOtherVariables(text, model, role, context) {
     let processedText = String(text);
 
     // SarModel 高级预设注入，对 system 角色或 VCPTavern 注入的 user 角色生效
-    if (role === 'system' || (role === 'user' && processedText.startsWith('[系统'))) {
+    if (role === 'system' || (role === 'user' && (processedText.startsWith('[系统提示:]') || processedText.startsWith('[系统邀请指令:]')))) {
         // 查找所有独特的 SarPrompt 占位符，例如 {{SarPrompt1}}, {{SarPrompt2}}
         const sarPlaceholderRegex = /\{\{(SarPrompt\d+)\}\}/g;
         const matches = [...processedText.matchAll(sarPlaceholderRegex)];
