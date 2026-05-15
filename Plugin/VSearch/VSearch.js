@@ -8,6 +8,7 @@ const { tavily } = require('@tavily/core');
 // --- 1. 初始化与配置加载 ---
 const configPath = path.resolve(__dirname, './config.env');
 const rootConfigPath = path.resolve(__dirname, '../../config.env');
+const manifestPath = path.resolve(__dirname, './plugin-manifest.json');
 
 dotenv.config({ path: configPath });
 
@@ -17,13 +18,27 @@ const {
     VSearchModel: MODEL,
     GrokModel: GROK_MODEL,
     TavilyModel: TAVILY_MODEL,
+    SummaryKey: SUMMARY_KEY,
+    SummaryUrl: SUMMARY_URL,
+    SummaryModel: SUMMARY_MODEL,
     VSearchMaxToken: MAX_TOKENS,
     MaxConcurrent: MAX_CONCURRENT,
-    HTTP_PROXY: PROXY
+    HTTP_PROXY: PROXY,
+    KimiSearchUrl: KIMI_SEARCH_URL,
+    KimiSearchKey: KIMI_SEARCH_KEY,
+    KimiSearchMaxResults: KIMI_SEARCH_MAX_RESULTS,
+    KimiSearchIncludeContent: KIMI_SEARCH_INCLUDE_CONTENT,
 } = process.env;
 
 const CONCURRENCY = parseInt(MAX_CONCURRENT, 10) || 5;
 const TOKENS = parseInt(MAX_TOKENS, 10) || 50000;
+const KIMI_MAX_RESULTS = Math.min(Math.max(parseInt(KIMI_SEARCH_MAX_RESULTS, 10) || 5, 1), 20);
+const KIMI_INCLUDE_CONTENT = KIMI_SEARCH_INCLUDE_CONTENT === 'true';
+const DEFAULT_PLUGIN_TIMEOUT_MS = 300000;
+const MIN_SAFE_REPLY_MARGIN_MS = 5000;
+const MAX_SAFE_REPLY_MARGIN_MS = 15000;
+const GROK_MAX_RETRIES = 3;
+const GROK_BASE_RETRY_DELAY_MS = 1200;
 
 // --- 2. 辅助函数 ---
 const log = (message) => {
@@ -36,7 +51,57 @@ const sendResponse = (data) => {
     process.exit(0);
 };
 
-const resolveRedirect = async (url) => {
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const getRemainingMs = (deadline) => Math.max(0, deadline - Date.now());
+
+const getSafeReplyMarginMs = (timeoutMs) => {
+    return Math.min(MAX_SAFE_REPLY_MARGIN_MS, Math.max(MIN_SAFE_REPLY_MARGIN_MS, Math.floor(timeoutMs * 0.05)));
+};
+
+const loadPluginTimeoutMs = async () => {
+    try {
+        const manifestContent = await fs.readFile(manifestPath, 'utf8');
+        const manifest = JSON.parse(manifestContent);
+        const timeout = Number(manifest?.communication?.timeout);
+        if (Number.isFinite(timeout) && timeout > 0) {
+            return timeout;
+        }
+        log(`manifest 未配置有效 communication.timeout，使用默认 ${DEFAULT_PLUGIN_TIMEOUT_MS}ms`);
+    } catch (error) {
+        log(`读取 plugin-manifest.json 超时配置失败，使用默认 ${DEFAULT_PLUGIN_TIMEOUT_MS}ms: ${error.message}`);
+    }
+    return DEFAULT_PLUGIN_TIMEOUT_MS;
+};
+
+const createDeadlineContext = async () => {
+    const timeoutMs = await loadPluginTimeoutMs();
+    const safeMarginMs = getSafeReplyMarginMs(timeoutMs);
+    const deadline = Date.now() + Math.max(1000, timeoutMs - safeMarginMs);
+    log(`插件硬超时 ${timeoutMs}ms，安全回复余量 ${safeMarginMs}ms，内部截止剩余 ${getRemainingMs(deadline)}ms`);
+    return { timeoutMs, safeMarginMs, deadline };
+};
+
+const withDeadline = (promise, deadline, onTimeout) => {
+    const remaining = getRemainingMs(deadline);
+    if (remaining <= 0) {
+        return Promise.resolve(onTimeout());
+    }
+    return Promise.race([
+        promise,
+        sleep(remaining).then(onTimeout)
+    ]);
+};
+
+const isGrokRetryableError = (error) => {
+    const status = error?.response?.status;
+    const message = (error?.message || '').toLowerCase();
+    return status === 503 || message.includes('503') || message.includes('empty') || message.includes('空响应');
+};
+
+const cleanGrokContent = (content) => content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+const resolveRedirect = async (url, signal) => {
     if (!url || !url.includes('vertexaisearch.cloud.google.com/grounding-api-redirect')) {
         return url;
     }
@@ -53,7 +118,8 @@ const resolveRedirect = async (url) => {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
             },
-            responseType: 'text'
+            responseType: 'text',
+            signal
         };
 
         if (PROXY) {
@@ -97,7 +163,7 @@ const resolveRedirect = async (url) => {
 /**
  * Grounding 模式 (Google Search)
  */
-const callGroundingMode = async (topic, keyword, showURL = false) => {
+const callGroundingMode = async (topic, keyword, showURL = false, deadline, signal) => {
     const now = new Date();
     const currentTime = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 
@@ -139,10 +205,16 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
     };
 
     try {
-        log(`[Grounding] 正在搜索关键词: "${keyword}"...`);
+        const remaining = deadline ? getRemainingMs(deadline) : 180000;
+        if (remaining <= 0) {
+            return `[搜索超时] 关键词: ${keyword}。已到达插件安全截止时间，跳过该关键词。`;
+        }
+
+        log(`[Grounding] 正在搜索关键词: "${keyword}"，剩余安全时间 ${remaining}ms...`);
         const response = await axios.post(API_URL, payload, {
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-            timeout: 180000, // 3分钟超时
+            timeout: Math.min(180000, remaining),
+            signal,
             proxy: false  // 禁用代理，代理仅用于 URL 重定向解析
         });
         let content = response.data.choices[0].message.content;
@@ -168,7 +240,7 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
             // 并发解析所有发现的 URL
             if (allVertexUrls.length > 0) {
                 await Promise.all(allVertexUrls.map(async (vUrl) => {
-                    const realUrl = await resolveRedirect(vUrl);
+                    const realUrl = await resolveRedirect(vUrl, signal);
                     if (realUrl !== vUrl) {
                         urlMap.set(vUrl, realUrl);
                     }
@@ -214,7 +286,7 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
 /**
  * Grok 模式 (内置搜索，单次请求处理所有关键词)
  */
-const callGrokMode = async (topic, keywordList) => {
+const callGrokOnce = async (topic, keywordList, deadline, attempt) => {
     const systemPrompt = `你是一个具备实时联网搜索能力的顶级 AI 助手。
 你的任务是针对用户提供的【检索目标主题】和一系列【检索关键词】，利用你的内置搜索能力获取最新信息并进行深度总结。
 请针对每个关键词进行搜索，并最终产出一份结构化、全景式的研究报告。`;
@@ -235,17 +307,59 @@ ${keywordList.map((kw, i) => `${i + 1}. ${kw}`).join('\n')}
         max_tokens: TOKENS
     };
 
+    const remaining = getRemainingMs(deadline);
+    if (remaining <= 0) {
+        throw new Error('Grok 请求启动前已到达插件安全截止时间');
+    }
+
+    const controller = new AbortController();
+    let deadlineTimer = null;
+
     try {
-        log(`[Grok] 正在执行全量搜索 (关键词数量: ${keywordList.length})...`);
+        log(`[Grok] 第 ${attempt} 次尝试执行全量搜索 (关键词数量: ${keywordList.length})，剩余安全时间 ${remaining}ms...`);
         const response = await axios.post(API_URL, payload, {
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             responseType: 'stream',
-            timeout: 300000,
+            timeout: remaining,
+            signal: controller.signal,
             proxy: false  // 禁用代理，代理仅用于 URL 重定向解析
         });
 
-        return new Promise((resolve, reject) => {
+        return await new Promise((resolve, reject) => {
             let fullContent = '';
+            let settled = false;
+
+            const finish = (content, truncated = false) => {
+                if (settled) return;
+                settled = true;
+                if (deadlineTimer) clearTimeout(deadlineTimer);
+                try {
+                    response.data.destroy();
+                } catch (e) { }
+                const cleanedContent = cleanGrokContent(content);
+                if (truncated) {
+                    const suffix = cleanedContent
+                        ? '\n\n[提示] 已到达插件安全截止时间，Grok 流式输出已截断，以上为已收到内容。'
+                        : '[提示] 已到达插件安全截止时间，但 Grok 尚未返回有效正文。';
+                    resolve(`${cleanedContent}${suffix}`);
+                    return;
+                }
+                resolve(cleanedContent);
+            };
+
+            const fail = (err) => {
+                if (settled) return;
+                settled = true;
+                if (deadlineTimer) clearTimeout(deadlineTimer);
+                reject(err);
+            };
+
+            deadlineTimer = setTimeout(() => {
+                log(`[Grok] 到达安全截止时间，截断流式输出并返回已收到内容`);
+                controller.abort();
+                finish(fullContent, true);
+            }, Math.max(1, getRemainingMs(deadline)));
+
             response.data.on('data', chunk => {
                 const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
                 for (const line of lines) {
@@ -261,17 +375,54 @@ ${keywordList.map((kw, i) => `${i + 1}. ${kw}`).join('\n')}
                 }
             });
 
-            response.data.on('end', () => {
-                const cleanedContent = fullContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-                resolve(cleanedContent);
+            response.data.on('end', () => finish(fullContent, false));
+            response.data.on('error', err => {
+                if (settled && (err.code === 'ERR_CANCELED' || err.message === 'canceled')) return;
+                fail(err);
             });
-
-            response.data.on('error', err => reject(err));
         });
     } catch (error) {
-        log(`[Grok] 全量搜索失败: ${error.message}`);
-        return `[Grok 搜索失败] 错误原因: ${error.message}`;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        controller.abort();
+        throw error;
     }
+};
+
+const callGrokMode = async (topic, keywordList, deadline) => {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= GROK_MAX_RETRIES; attempt++) {
+        try {
+            const result = await callGrokOnce(topic, keywordList, deadline, attempt);
+            if (result && result.trim()) {
+                return result;
+            }
+
+            lastError = new Error('Grok 空响应');
+            if (attempt >= GROK_MAX_RETRIES) break;
+        } catch (error) {
+            lastError = error;
+            if (!isGrokRetryableError(error) || attempt >= GROK_MAX_RETRIES) {
+                break;
+            }
+        }
+
+        const delayMs = Math.min(GROK_BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1), 10000);
+        const remaining = getRemainingMs(deadline);
+        if (remaining <= delayMs + 1000) {
+            log(`[Grok] 剩余安全时间不足以继续退避重试，停止重试`);
+            break;
+        }
+
+        log(`[Grok] 检测到可重试错误/空响应，${delayMs}ms 后进行第 ${attempt + 1} 次尝试。原因: ${lastError.message}`);
+        await sleep(delayMs);
+    }
+
+    const message = lastError?.response?.status
+        ? `HTTP ${lastError.response.status}: ${lastError.message}`
+        : (lastError?.message || '未知错误');
+    log(`[Grok] 全量搜索失败: ${message}`);
+    return `[Grok 搜索失败] 错误原因: ${message}`;
 };
 
 /**
@@ -348,17 +499,23 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
     }
 
     // === 阶段2: 模型总结 ===
+    const summaryKey = SUMMARY_KEY || API_KEY;
+    const summaryUrl = SUMMARY_URL || API_URL;
+    const summaryModel = SUMMARY_MODEL || TAVILY_MODEL || "claude-sonnet-4-6";
+
+    if (!summaryKey || !summaryUrl) {
+        log(`[Tavily] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），跳过总结阶段，直接返回原始结果`);
+        return combinedResults;
+    }
+
     try {
-        const summaryModel = TAVILY_MODEL || "claude-sonnet-4-6";
-        log(`[Tavily] 阶段2/2: 正在使用 ${summaryModel} 通过 ${API_URL} 进行全量总结...`);
+        log(`[Tavily] 阶段2/2: 正在使用 ${summaryModel} 通过 ${summaryUrl} 进行全量总结...`);
         const summaryPayload = {
             model: summaryModel,
             messages: [
                 {
                     role: 'system',
-                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。
-你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。
-请保留重要的 URL 链接，并确保报告逻辑严密。`
+                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
                 },
                 { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
             ],
@@ -366,12 +523,12 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
         };
 
         const summaryAxiosConfig = {
-            headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+            headers: { 'Authorization': `Bearer ${summaryKey}`, 'Content-Type': 'application/json' },
             timeout: 180000,
             proxy: false  // 显式禁用代理，避免环境变量残留干扰
         };
 
-        const summaryResponse = await axios.post(API_URL, summaryPayload, summaryAxiosConfig);
+        const summaryResponse = await axios.post(summaryUrl, summaryPayload, summaryAxiosConfig);
 
         log(`[Tavily] 阶段2/2 完成: 总结成功`);
         return summaryResponse.data.choices[0].message.content;
@@ -385,8 +542,117 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
     }
 };
 
+/**
+ * 单次调用 Kimi Search API
+ */
+const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent) => {
+    const url = baseUrl.endsWith('/search') ? baseUrl : `${baseUrl.replace(/\/$/, '')}/search`;
+    try {
+        log(`[KimiSearch] 正在搜索: "${query}"...`);
+        const response = await axios.post(url, {
+            text_query: query,
+            limit: maxResults,
+            enable_page_crawling: includeContent,
+            timeout_seconds: 30
+        }, {
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+                'X-Msh-Tool-Call-Id': `vsearch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+            },
+            timeout: 180000,
+            proxy: false
+        });
+
+        const results = response.data.search_results || [];
+        if (results.length === 0) {
+            return '未找到相关搜索结果。\n';
+        }
+
+        let markdown = '';
+        results.forEach((item, index) => {
+            markdown += `${index + 1}. **${item.title}**\n`;
+            markdown += `   URL: ${item.url}\n`;
+            if (item.date) markdown += `   Date: ${item.date}\n`;
+            if (item.site_name) markdown += `   Source: ${item.site_name}\n`;
+            markdown += `   Summary: ${item.snippet}\n`;
+            if (item.content) {
+                markdown += `\n   ${item.content}\n`;
+            }
+            markdown += '\n';
+        });
+        return markdown;
+    } catch (error) {
+        const status = error.response?.status || 'N/A';
+        log(`[KimiSearch] 搜索失败 (HTTP ${status}): ${error.message}`);
+        return `[搜索失败] 错误原因: ${error.message}`;
+    }
+};
+
+/**
+ * KimiSearch 模式 (并发搜索 + 可选 LLM 总结)
+ */
+const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent) => {
+    // === 阶段1: 并发搜索 ===
+    let combinedResults = '';
+    try {
+        log(`[KimiSearch] 阶段1/2: 正在并发获取 ${keywordList.length} 个关键词的搜索结果...`);
+        const searchPromises = keywordList.map(async (kw) => {
+            const result = await callKimiSearch(kw, apiKey, baseUrl, maxResults, includeContent);
+            log(`[KimiSearch] 关键词 "${kw}" 搜索完成`);
+            return `### 关键词: ${kw}\n${result}`;
+        });
+        const allSearchResults = await Promise.all(searchPromises);
+        combinedResults = allSearchResults.join('\n---\n');
+        log(`[KimiSearch] 阶段1/2 完成: 搜索结果总长度 ${combinedResults.length} 字符`);
+    } catch (searchError) {
+        log(`[KimiSearch] 阶段1 搜索整体失败: ${searchError.message}`);
+        return `[KimiSearch 搜索阶段失败] 错误原因: ${searchError.message}`;
+    }
+
+    // === 阶段2: 模型总结 (如果配置了 LLM API) ===
+    const summaryKey = SUMMARY_KEY || API_KEY;
+    const summaryUrl = SUMMARY_URL || API_URL;
+    const summaryModel = SUMMARY_MODEL || MODEL || "claude-sonnet-4-6";
+
+    if (!summaryKey || !summaryUrl) {
+        log(`[KimiSearch] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），跳过总结阶段，直接返回原始结果`);
+        return combinedResults;
+    }
+
+    try {
+        log(`[KimiSearch] 阶段2/2: 正在使用 ${summaryModel} 通过 ${summaryUrl} 进行全量总结...`);
+        const summaryPayload = {
+            model: summaryModel,
+            messages: [
+                {
+                    role: 'system',
+                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
+                },
+                { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
+            ],
+            max_tokens: TOKENS
+        };
+
+        const summaryResponse = await axios.post(summaryUrl, summaryPayload, {
+            headers: { 'Authorization': `Bearer ${summaryKey}`, 'Content-Type': 'application/json' },
+            timeout: 300000,
+            proxy: false
+        });
+
+        log(`[KimiSearch] 阶段2/2 完成: 总结成功`);
+        return summaryResponse.data.choices[0].message.content;
+    } catch (summaryError) {
+        const statusCode = summaryError.response?.status || 'N/A';
+        const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
+        log(`[KimiSearch] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
+        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
+    }
+};
+
 async function main(request) {
-    const { SearchTopic, Keywords, ShowURL, SearchMode = 'grounding' } = request;
+    const { SearchTopic, Keywords, ShowURL, 
+        SearchMode = process.env.SearchMode || 'kimisearch' } = request;
     const showURL = ShowURL === true || ShowURL === 'true';
 
     if (!SearchTopic || !Keywords) {
@@ -398,11 +664,12 @@ async function main(request) {
         return sendResponse({ status: "error", error: "未识别到有效的关键词。" });
     }
 
+    const { deadline } = await createDeadlineContext();
     log(`启动 VSearch [模式: ${SearchMode}]。主题: "${SearchTopic}"，关键词数量: ${keywordList.length}`);
 
     if (SearchMode === 'grok') {
-        // Grok 模式：单次请求处理所有关键词
-        const result = await callGrokMode(SearchTopic, keywordList);
+        // Grok 模式：单次请求处理所有关键词，安全截止前截断流式输出，并对 503/空响应做指数退避重试
+        const result = await callGrokMode(SearchTopic, keywordList, deadline);
         return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: Grok]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
@@ -423,18 +690,64 @@ async function main(request) {
         return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: Tavily]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
-    // Grounding 模式：保持原有的并发分批逻辑
-    let allResults = [];
-    for (let i = 0; i < keywordList.length; i += CONCURRENCY) {
-        const chunk = keywordList.slice(i, i + CONCURRENCY);
-        const promises = chunk.map(kw => callGroundingMode(SearchTopic, kw, showURL));
-        const results = await Promise.all(promises);
-        results.forEach((res, idx) => {
-            allResults.push(`### 关键词: ${chunk[idx]}\n${res}\n\n---\n\n`);
-        });
+    if (SearchMode === 'kimisearch') {
+        // KimiSearch 模式：调用 Kimi Search API
+        if (!KIMI_SEARCH_KEY) {
+            return sendResponse({ status: "error", error: "KimiSearch 模式需要在 config.env 中配置 KimiSearchKey。" });
+        }
+        if (!KIMI_SEARCH_URL) {
+            return sendResponse({ status: "error", error: "KimiSearch 模式需要在 config.env 中配置 KimiSearchUrl。" });
+        }
+        const result = await callKimiSearchMode(SearchTopic, keywordList, KIMI_SEARCH_KEY, KIMI_SEARCH_URL, KIMI_MAX_RESULTS, KIMI_INCLUDE_CONTENT);
+        return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: KimiSearch]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
-    const finalOutput = `## VSearch 检索报告 [模式: Grounding]\n\n**研究主题**: ${SearchTopic}\n\n${allResults.join('')}`;
+    // Grounding 模式：并发分批执行；到达安全截止时间时，抛弃未返回搜索，直接返回已完成结果
+    let allResults = [];
+    let timedOut = false;
+    for (let i = 0; i < keywordList.length; i += CONCURRENCY) {
+        if (getRemainingMs(deadline) <= 0) {
+            timedOut = true;
+            log(`[Grounding] 到达安全截止时间，停止启动后续批次`);
+            break;
+        }
+
+        const chunk = keywordList.slice(i, i + CONCURRENCY);
+        const settledResults = [];
+        const controllers = chunk.map(() => new AbortController());
+
+        const promises = chunk.map((kw, idx) => callGroundingMode(SearchTopic, kw, showURL, deadline, controllers[idx].signal)
+            .then(result => {
+                settledResults[idx] = { keyword: kw, result };
+            })
+            .catch(error => {
+                settledResults[idx] = { keyword: kw, result: `[搜索失败] 关键词: ${kw}。错误原因: ${error.message}` };
+            }));
+
+        await withDeadline(
+            Promise.allSettled(promises),
+            deadline,
+            () => {
+                timedOut = true;
+                controllers.forEach(controller => controller.abort());
+                log(`[Grounding] 当前批次到达安全截止时间，抛弃未完成搜索并返回已完成结果`);
+                return null;
+            }
+        );
+
+        settledResults.forEach(item => {
+            if (item) {
+                allResults.push(`### 关键词: ${item.keyword}\n${item.result}\n\n---\n\n`);
+            }
+        });
+
+        if (timedOut) break;
+    }
+
+    const timeoutNotice = timedOut
+        ? `\n\n> [提示] 已到达插件安全截止时间，未完成的 Grounding 搜索已被抛弃；以下为截止前已完成的结果。\n\n`
+        : '\n\n';
+    const finalOutput = `## VSearch 检索报告 [模式: Grounding]\n\n**研究主题**: ${SearchTopic}${timeoutNotice}${allResults.join('') || '[提示] 安全截止前没有搜索任务完成。'}`;
     sendResponse({ status: "success", result: finalOutput });
 }
 

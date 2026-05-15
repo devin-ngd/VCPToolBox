@@ -6,23 +6,42 @@ module.exports = function(options) {
     const router = express.Router();
     const { pluginManager } = options;
 
+    let restartInFlight = false;
+
     // POST to restart the server
     router.post('/server/restart', async (req, res) => {
-        res.json({ message: '服务器重启命令已发送。服务器正在关闭，如果由进程管理器（如 PM2）管理，它应该会自动重启。' });
+        const { triggerRestart } = options;
 
-        setTimeout(() => {
-            console.log('[AdminPanelRoutes] Received restart command. Shutting down...');
-
-            // 强制清除Node.js模块缓存
-            const moduleKeys = Object.keys(require.cache);
-            moduleKeys.forEach(key => {
-                if (key.includes('TextChunker.js') || key.includes('VectorDBManager.js')) {
-                    delete require.cache[key];
-                }
+        if (restartInFlight) {
+            return res.status(202).json({
+                status: 'restarting',
+                message: '服务器已在执行优雅重启流程，请勿重复触发。'
             });
+        }
 
-            process.exit(1);
-        }, 1000);
+        if (typeof triggerRestart !== 'function') {
+            console.warn('[AdminPanelRoutes] No triggerRestart callback found.');
+            return res.status(500).json({
+                status: 'error',
+                message: '服务器未配置重启处理器，无法执行优雅重启。'
+            });
+        }
+
+        restartInFlight = true;
+        res.status(202).json({
+            status: 'accepted',
+            message: '服务器重启命令已接纳。正在进入优雅排空与重启流程...'
+        });
+
+        setImmediate(async () => {
+            console.log('[AdminPanelRoutes][RESTART_V2_SENTINEL_20260424] Received restart command. Initiating controlled shutdown...');
+            try {
+                await triggerRestart(1); // 传 1 以确保 PM2 检测到状态变化并自动拉起
+            } catch (error) {
+                restartInFlight = false;
+                console.error('[AdminPanelRoutes] Graceful restart failed:', error);
+            }
+        });
     });
 
     // 验证登录端点

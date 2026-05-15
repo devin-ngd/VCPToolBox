@@ -511,10 +511,10 @@ async function writeEscapedFile(filePath, content, encoding = 'utf8') {
   // Replace the escaped delimiters with the actual ones
   // Replace all escaped delimiters with the actual ones
   const processedContent = content
-    .replace(/「始exp」/g, '「始」')
-    .replace(/「末exp」/g, '「末」')
-    .replace(/<<<\[TOOL_REQUEST_EXP\]>>>/g, '<<<[TOOL_REQUEST]>>>')
-    .replace(/<<<\[END_TOOL_REQUEST_EXP\]>>>/g, '<<<[END_TOOL_REQUEST]>>>');
+    .replace(/「始ESCAPE」/g, '「始」')
+    .replace(/「末ESCAPE」/g, '「末」')
+    .replace(/<<<\[TOOL_REQUEST_ESCAPE\]>>>/g, '<<<[TOOL_REQUEST]>>>')
+    .replace(/<<<\[END_TOOL_REQUEST_ESCAPE\]>>>/g, '<<<[END_TOOL_REQUEST]>>>');
 
   // Delegate the actual writing to the original writeFile function
   // This reuses all the safety checks, unique file naming, etc.
@@ -665,7 +665,7 @@ async function listDirectory(dirPath, showHidden = ENABLE_HIDDEN_FILES) {
 
     const message = `Directory listing of \`${dirPath}\` (${result.length} items${items.length > MAX_DIRECTORY_ITEMS ? ', truncated' : ''})`;
 
-    let markdownTable = `| 名称 | 类型 | 大小 | 修改时间 | 隐藏 |\n|---|---|---|---|---|\n`;
+    let markdownTable = `---\n| 名称 | 类型 | 大小 | 修改时间 | 隐藏 |\n|---|---|---|---|---|\n`;
     for (const item of result) {
       const typeStr = item.type === 'directory' ? '📁' : '📄';
       const sizeStr = item.sizeFormatted || '-';
@@ -673,6 +673,7 @@ async function listDirectory(dirPath, showHidden = ENABLE_HIDDEN_FILES) {
       const hiddenStr = item.isHidden ? '是' : '否';
       markdownTable += `| ${typeStr} **${item.name}** | ${item.type} | ${sizeStr} | ${timeStr} | ${hiddenStr} |\n`;
     }
+    markdownTable += `---`;
 
     return {
       success: true,
@@ -1179,12 +1180,12 @@ async function listAllowedDirectories() {
     } else if (items.length === 1 && (items[0].type === 'error' || items[0].type === 'info')) {
       markdownContent += `*${items[0].name}*\n\n`;
     } else {
-      markdownContent += `| 名称 | 类型 |\n|---|---|\n`;
+      markdownContent += `---\n| 名称 | 类型 |\n|---|---|\n`;
       for (const item of items) {
         const typeIcon = item.type === 'directory' ? '📁' : '📄';
         markdownContent += `| ${typeIcon} **${item.name}** | ${item.type} |\n`;
       }
-      markdownContent += '\n';
+      markdownContent += `---\n\n`;
     }
   }
 

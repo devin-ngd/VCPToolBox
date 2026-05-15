@@ -5,6 +5,8 @@ const lunarCalendar = require('chinese-lunar-calendar');
 const agentManager = require('./agentManager.js'); // 引入新的Agent管理器
 const tvsManager = require('./tvsManager.js'); // 引入新的TVS管理器
 const toolboxManager = require('./toolboxManager.js');
+const dynamicToolRegistry = require('./dynamicToolRegistry.js');
+const sarPromptManager = require('./sarPromptManager.js');
 
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || 'Asia/Shanghai'; // 新增：用于控制 AI 报告的时间，默认回退到中国时区
@@ -373,7 +375,10 @@ async function replaceOtherVariables(text, model, role, context) {
     let processedText = String(text);
 
     // SarModel 高级预设注入，对 system 角色或 VCPTavern 注入的 user 角色生效
-    if (role === 'system' || (role === 'user' && (processedText.startsWith('[系统提示:]') || processedText.startsWith('[系统邀请指令:]')))) {
+    const systemMarkers = ['[系统提示:]', '[系统邀请指令:]', '[系统通知:]', '[系统通知]'];
+    const isSystemLike = role === 'system' || (role === 'user' && systemMarkers.some(marker => processedText.startsWith(marker)));
+
+    if (isSystemLike) {
         // 查找所有独特的 SarPrompt 占位符，例如 {{SarPrompt1}}, {{SarPrompt2}}
         const sarPlaceholderRegex = /\{\{(SarPrompt\d+)\}\}/g;
         const matches = [...processedText.matchAll(sarPlaceholderRegex)];
@@ -382,22 +387,17 @@ async function replaceOtherVariables(text, model, role, context) {
         for (const placeholder of uniquePlaceholders) {
             // 从 {{SarPrompt4}} 中提取 SarPrompt4
             const promptKey = placeholder.substring(2, placeholder.length - 2);
-            // 从 SarPrompt4 中提取数字 4
-            const numberMatch = promptKey.match(/\d+$/);
-            if (!numberMatch) continue;
-
-            const index = numberMatch[0];
-            const modelKey = `SarModel${index}`;
-
-            const models = process.env[modelKey];
-            let promptValue = process.env[promptKey];
+            
+            // 从 sarPromptManager 中查找匹配的 promptKey
+            const prompts = sarPromptManager.getAllPrompts();
+            const group = prompts.find(g => g.promptKey === promptKey);
             let replacementText = ''; // 默认替换为空字符串
 
-            // 检查模型和提示是否存在
-            if (models && promptValue) {
-                const modelList = models.split(',').map(m => m.trim().toLowerCase());
+            if (group && group.models && group.content) {
+                const modelList = group.models.map(m => m.trim().toLowerCase());
                 // 检查当前模型是否在列表中
                 if (model && modelList.includes(model.toLowerCase())) {
+                    let promptValue = group.content;
                     // 模型匹配，准备注入的文本
                     if (typeof promptValue === 'string' && promptValue.toLowerCase().endsWith('.txt')) {
                         const fileContent = await tvsManager.getContent(promptValue);
@@ -487,6 +487,19 @@ async function replaceOtherVariables(text, model, role, context) {
         }
 
         const individualPluginDescriptions = pluginManager.getIndividualPluginDescriptions();
+        if (processedText.includes('{{VCPDynamicTools}}')) {
+            let dynamicToolsText = '[VCPDynamicTools information unavailable]';
+            try {
+                dynamicToolsText = await dynamicToolRegistry.buildInjection({
+                    messages: context.messages || context.originalMessages || [],
+                    pluginManager,
+                    debugMode: DEBUG_MODE
+                });
+            } catch (error) {
+                console.error('[replaceOtherVariables] Error processing {{VCPDynamicTools}}:', error);
+            }
+            processedText = processedText.replaceAll('{{VCPDynamicTools}}', dynamicToolsText);
+        }
         if (individualPluginDescriptions && individualPluginDescriptions.size > 0) {
             for (const [placeholderKey, description] of individualPluginDescriptions) {
                 processedText = processedText.replaceAll(`{{${placeholderKey}}}`, description || `[${placeholderKey} 信息不可用]`);
@@ -526,15 +539,20 @@ async function replaceOtherVariables(text, model, role, context) {
         }
     }
 
-    const asyncResultPlaceholderRegex = /\{\{VCP_ASYNC_RESULT::([a-zA-Z0-9_.-]+)::([a-zA-Z0-9_-]+)\}\}/g;
+    // 同时兼容标准双花括号、异常三花括号、以及被字符串转义后常见的四花括号格式
+    // 例如：
+    // {{VCP_ASYNC_RESULT::Plugin::id}}
+    // {{{VCP_ASYNC_RESULT::Plugin::id}}}
+    // {{{{VCP_ASYNC_RESULT::Plugin::id}}}}
+    const asyncResultPlaceholderRegex = /\{\{\{\{VCP_ASYNC_RESULT::([a-zA-Z0-9_.-]+)::([a-zA-Z0-9_-]+)\}\}\}\}|\{\{\{VCP_ASYNC_RESULT::([a-zA-Z0-9_.-]+)::([a-zA-Z0-9_-]+)\}\}\}|\{\{VCP_ASYNC_RESULT::([a-zA-Z0-9_.-]+)::([a-zA-Z0-9_-]+)\}\}/g;
     let asyncMatch;
     let tempAsyncProcessedText = processedText;
     const promises = [];
 
     while ((asyncMatch = asyncResultPlaceholderRegex.exec(processedText)) !== null) {
         const placeholder = asyncMatch[0];
-        const pluginName = asyncMatch[1];
-        const requestId = asyncMatch[2];
+        const pluginName = asyncMatch[1] || asyncMatch[3] || asyncMatch[5];
+        const requestId = asyncMatch[2] || asyncMatch[4] || asyncMatch[6];
 
         promises.push(
             (async () => {

@@ -10,6 +10,7 @@ const express = require('express'); // For plugin API routing
 const chokidar = require('chokidar');
 const { getAuthCode } = require('./modules/captchaDecoder'); // 导入统一的解码函数
 const ToolApprovalManager = require('./modules/toolApprovalManager');
+const { hasFoldMarkers, buildDynamicFoldObject } = require('./modules/foldProtocol');
 
 const PLUGIN_DIR = path.join(__dirname, 'Plugin');
 const manifestFileName = 'plugin-manifest.json';
@@ -204,21 +205,34 @@ class PluginManager extends EventEmitter {
 
                 let parsedValue = newValue;
                 if (newValue !== null) {
+                    const trimmedValue = newValue.trim();
+                    parsedValue = trimmedValue;
+
                     try {
-                        let trimmedValue = newValue.trim();
-                        // 尝试解析 JSON，支持 vcp_dynamic_fold 协议
+                        // 优先兼容原有 JSON dynamic fold 协议
                         if (trimmedValue.startsWith('{')) {
                             const jsonObj = JSON.parse(trimmedValue);
                             if (jsonObj && jsonObj.vcp_dynamic_fold) {
                                 parsedValue = jsonObj; // 保持对象形式以供折叠处理
-                            } else {
-                                parsedValue = trimmedValue;
                             }
+                        } else if (hasFoldMarkers(trimmedValue)) {
+                            // 兼容共享的文本折叠协议，支持 [===vcp_fold: x ::desc: ...===]
+                            parsedValue = buildDynamicFoldObject({
+                                content: trimmedValue,
+                                pluginDescription: plugin.description || plugin.displayName || plugin.name,
+                                strategy: 'toolbox_block_similarity'
+                            });
+                        }
+                    } catch (e) {
+                        if (hasFoldMarkers(trimmedValue)) {
+                            parsedValue = buildDynamicFoldObject({
+                                content: trimmedValue,
+                                pluginDescription: plugin.description || plugin.displayName || plugin.name,
+                                strategy: 'toolbox_block_similarity'
+                            });
                         } else {
                             parsedValue = trimmedValue;
                         }
-                    } catch (e) {
-                        parsedValue = newValue.trim();
                     }
                 }
 
@@ -732,7 +746,10 @@ class PluginManager extends EventEmitter {
 
                     await module.initialize(initialConfig, dependencies);
                 } catch (e) {
-                    console.error(`[PluginManager] Error initializing module for ${manifest.name}:`, e);
+                    console.error(`[PluginManager] Error initializing module for ${manifest.name}:`, e instanceof Error ? e.message : JSON.stringify(e));
+                    if (e instanceof Error && e.stack) {
+                        console.error(`[PluginManager] Stack trace for ${manifest.name}:`, e.stack);
+                    }
                 }
             }
 
@@ -746,6 +763,7 @@ class PluginManager extends EventEmitter {
                 }
             }
 
+            this.emit('tools_changed', { reason: 'local_reload' });
             console.log(`[PluginManager] Plugin discovery finished. Loaded ${this.plugins.size} plugins.`);
         } catch (error) {
             if (error.code === 'ENOENT') console.error(`[PluginManager] Plugin directory ${PLUGIN_DIR} not found.`);
@@ -831,7 +849,7 @@ class PluginManager extends EventEmitter {
         };
     }
 
-    async processToolCall(toolName, toolArgs, requestIp = null) {
+    async processToolCall(toolName, toolArgs, requestIp = null, sourceNode = null) {
         const plugin = this.plugins.get(toolName);
         if (!plugin) {
             throw new Error(`[PluginManager] Plugin "${toolName}" not found for tool call.`);
@@ -855,8 +873,22 @@ class PluginManager extends EventEmitter {
             return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${milliseconds}${timezoneString}`;
         };
 
+        // Helper to clean up fuzzyDiff output for error/success responses
+        const _filterFuzzyDiff = (resultObj, timestamp) => {
+            if (resultObj && typeof resultObj === 'object' &&
+                resultObj.fuzzyDiff && typeof resultObj.fuzzyDiff === 'object') {
+                const { candidateFile, diff } = resultObj.fuzzyDiff;
+                resultObj.fuzzyDiff = { candidateFile, diff, timestamp };
+            }
+        };
+
         const maidNameFromArgs = toolArgs && toolArgs.maid ? toolArgs.maid : null;
         const pluginSpecificArgs = { ...toolArgs };
+
+        if (maidNameFromArgs && sourceNode) {
+            console.log(`[VCPToolUse]来自${sourceNode}节点(${requestIp || '未知IP'})的${maidNameFromArgs}调用了${toolName}`);
+        }
+
         if (maidNameFromArgs) {
             // The 'maid' parameter is intentionally passed through for plugins like DeepMemo.
             // delete pluginSpecificArgs.maid;
@@ -902,9 +934,14 @@ class PluginManager extends EventEmitter {
         // --- 透明化处理结束 ---
 
         // --- 人工审核逻辑 (新增) ---
-        if (this.toolApprovalManager.shouldApprove(toolName)) {
+        const approvalDecision = this.toolApprovalManager.getApprovalDecision(toolName, pluginSpecificArgs);
+        if (approvalDecision.requiresApproval) {
             const requestId = `approve-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-            if (this.debugMode) console.log(`[PluginManager] Tool call for "${toolName}" requires manual approval. Request ID: ${requestId}`);
+            if (this.debugMode) {
+                console.log(
+                    `[PluginManager] Tool call for "${toolName}" requires manual approval. Request ID: ${requestId}. notifyAiOnReject=${approvalDecision.notifyAiOnReject !== false}`
+                );
+            }
 
             const approvalPromise = new Promise((resolve, reject) => {
                 const timeoutDuration = this.toolApprovalManager.getTimeoutMs();
@@ -915,7 +952,12 @@ class PluginManager extends EventEmitter {
                     }
                 }, timeoutDuration);
 
-                this.pendingApprovals.set(requestId, { resolve, reject, timeoutId });
+                this.pendingApprovals.set(requestId, {
+                    resolve,
+                    reject,
+                    timeoutId,
+                    notifyAiOnReject: approvalDecision.notifyAiOnReject !== false
+                });
             });
 
             // 发送审核请求到管理面板
@@ -938,7 +980,13 @@ class PluginManager extends EventEmitter {
             }
 
             try {
-                await approvalPromise;
+                const approvalResult = await approvalPromise;
+                if (approvalResult && approvalResult.silentRejected === true) {
+                    if (this.debugMode) {
+                        console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) was rejected silently. Returning empty result to AI.`);
+                    }
+                    return undefined;
+                }
                 if (this.debugMode) console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) approved.`);
             } catch (error) {
                 if (this.debugMode) console.warn(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) rejected: ${error.message}`);
@@ -1009,7 +1057,13 @@ class PluginManager extends EventEmitter {
                         resultFromPlugin = pluginOutput.result;
                     }
                 } else {
-                    throw new Error(JSON.stringify({ plugin_error: pluginOutput.error || `Plugin "${toolName}" reported an unspecified error.` }));
+                    const normalizedPluginOutput = {};
+                    if (pluginOutput.result) {
+                        normalizedPluginOutput.result = pluginOutput.result;
+                    }
+                    normalizedPluginOutput.plugin_error = pluginOutput.error || `Plugin "${toolName}" reported an unspecified error.`;
+                    _filterFuzzyDiff(normalizedPluginOutput, _getFormattedLocalTimestamp());
+                    throw new Error(JSON.stringify(normalizedPluginOutput));
                 }
             }
 
@@ -1020,6 +1074,7 @@ class PluginManager extends EventEmitter {
                 finalResultObject.MaidName = maidNameFromArgs;
             }
             finalResultObject.timestamp = _getFormattedLocalTimestamp();
+            _filterFuzzyDiff(finalResultObject, _getFormattedLocalTimestamp());
 
             return finalResultObject;
 
@@ -1038,6 +1093,7 @@ class PluginManager extends EventEmitter {
             if (!errorObject.timestamp) {
                 errorObject.timestamp = _getFormattedLocalTimestamp();
             }
+            _filterFuzzyDiff(errorObject, _getFormattedLocalTimestamp());
             throw new Error(JSON.stringify(errorObject));
         }
     }
@@ -1281,6 +1337,8 @@ class PluginManager extends EventEmitter {
             clearTimeout(approval.timeoutId);
             if (approved) {
                 approval.resolve();
+            } else if (approval.notifyAiOnReject === false) {
+                approval.resolve({ silentRejected: true });
             } else {
                 approval.reject(new Error(JSON.stringify({ plugin_error: 'Manual approval was REJECTED by user.' })));
             }
@@ -1373,14 +1431,25 @@ class PluginManager extends EventEmitter {
         }
         // 注册后重建描述，以包含新插件
         this.buildVCPDescription();
+        this.emit('tools_changed', { reason: 'distributed_register', serverId });
     }
 
     unregisterAllDistributedTools(serverId) {
         if (this.debugMode) console.log(`[PluginManager] Unregistering all tools from distributed server: ${serverId}`);
         let unregisteredCount = 0;
+        const unregisteredPluginNames = [];
+        const unregisteredManifests = [];
         for (const [name, manifest] of this.plugins.entries()) {
             if (manifest.isDistributed && manifest.serverId === serverId) {
-                this.plugins.delete(name);
+                unregisteredPluginNames.push(name);
+                unregisteredManifests.push(JSON.parse(JSON.stringify(manifest)));
+            }
+        }
+        if (unregisteredPluginNames.length > 0) {
+            this.emit('distributed_tools_offline', { serverId, pluginNames: unregisteredPluginNames, manifests: unregisteredManifests });
+        }
+        for (const name of unregisteredPluginNames) {
+            if (this.plugins.delete(name)) {
                 unregisteredCount++;
                 if (this.debugMode) console.log(`  - Unregistered: ${name}`);
             }
@@ -1392,6 +1461,9 @@ class PluginManager extends EventEmitter {
         }
 
         // 新增：清理分布式静态占位符
+        if (unregisteredCount > 0) {
+            this.emit('tools_changed', { reason: 'distributed_unregister', serverId, pluginNames: unregisteredPluginNames });
+        }
         this.clearDistributedStaticPlaceholders(serverId);
     }
 
@@ -1402,16 +1474,33 @@ class PluginManager extends EventEmitter {
         }
 
         for (const [placeholder, value] of Object.entries(placeholders)) {
-            // 新增逻辑：尝试解析可能的 JSON 折叠对象
+            // 兼容 JSON 折叠对象与共享文本折叠协议
             let parsedValue = value;
-            if (typeof value === 'string' && value.trim().startsWith('{')) {
-                try {
-                    const jsonObj = JSON.parse(value.trim());
-                    if (jsonObj && jsonObj.vcp_dynamic_fold) {
-                        parsedValue = jsonObj; // 保持对象形式以供折叠处理
+            if (typeof value === 'string') {
+                const trimmedValue = value.trim();
+                parsedValue = trimmedValue;
+
+                if (trimmedValue.startsWith('{')) {
+                    try {
+                        const jsonObj = JSON.parse(trimmedValue);
+                        if (jsonObj && jsonObj.vcp_dynamic_fold) {
+                            parsedValue = jsonObj; // 保持对象形式以供折叠处理
+                        }
+                    } catch (e) {
+                        if (hasFoldMarkers(trimmedValue)) {
+                            parsedValue = buildDynamicFoldObject({
+                                content: trimmedValue,
+                                pluginDescription: placeholder,
+                                strategy: 'toolbox_block_similarity'
+                            });
+                        }
                     }
-                } catch (e) {
-                    // 解析失败说明只是普通的字符串，可以直接忽略错误
+                } else if (hasFoldMarkers(trimmedValue)) {
+                    parsedValue = buildDynamicFoldObject({
+                        content: trimmedValue,
+                        pluginDescription: placeholder,
+                        strategy: 'toolbox_block_similarity'
+                    });
                 }
             }
 
@@ -1475,12 +1564,15 @@ class PluginManager extends EventEmitter {
     startPluginWatcher() {
         if (this.debugMode) console.log('[PluginManager] Starting plugin file watcher...');
 
-        const pathsToWatch = [
-            path.join(PLUGIN_DIR, '**/plugin-manifest.json'),
-            path.join(PLUGIN_DIR, '**/plugin-manifest.json.block')
-        ];
-
-        const watcher = chokidar.watch(pathsToWatch, {
+        const watcher = chokidar.watch(PLUGIN_DIR, {
+            ignored: [
+                '**/node_modules/**',
+                '**/.git/**',
+                '**/dist/**',
+                '**/target/**',
+                '**/image/**',
+                '**/.*'
+            ],
             persistent: true,
             ignoreInitial: true, // Don't fire on initial scan
             awaitWriteFinish: {
@@ -1489,12 +1581,23 @@ class PluginManager extends EventEmitter {
             }
         });
 
-        watcher
-            .on('add', filePath => this.handlePluginManifestChange('add', filePath))
-            .on('change', filePath => this.handlePluginManifestChange('change', filePath))
-            .on('unlink', filePath => this.handlePluginManifestChange('unlink', filePath));
+        const filterManifest = (filePath) => {
+            const fileName = path.basename(filePath);
+            return fileName === 'plugin-manifest.json' || fileName === 'plugin-manifest.json.block';
+        };
 
-        console.log(`[PluginManager] Chokidar is now watching for manifest changes in: ${PLUGIN_DIR}`);
+        watcher
+            .on('add', filePath => {
+                if (filterManifest(filePath)) this.handlePluginManifestChange('add', filePath);
+            })
+            .on('change', filePath => {
+                if (filterManifest(filePath)) this.handlePluginManifestChange('change', filePath);
+            })
+            .on('unlink', filePath => {
+                if (filterManifest(filePath)) this.handlePluginManifestChange('unlink', filePath);
+            });
+
+        console.log(`[PluginManager] Chokidar is now watching ${PLUGIN_DIR} for manifest changes.`);
     }
 
     handlePluginManifestChange(eventType, filePath) {

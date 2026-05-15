@@ -1,9 +1,16 @@
 // WebSocketServer.js
 const WebSocket = require('ws');
 const url = require('url');
+const fs = require('fs').promises;
+const path = require('path');
 
 let wssInstance;
 let pluginManager = null; // 为 PluginManager 实例占位
+let attachedHttpServer = null;
+let upgradeHandler = null;
+let isDraining = false;
+let shutdownPromise = null;
+
 let serverConfig = {
     debugMode: false,
     vcpKey: null
@@ -18,6 +25,7 @@ const adminPanelClients = new Map(); // 新增：管理面板客户端
 const pendingToolRequests = new Map(); // 跨服务器工具调用的待处理请求
 const distributedServerIPs = new Map(); // 新增：存储分布式服务器的IP信息
 const waitingControlClients = new Map(); // 新增：存储等待页面更新的ChromeControl客户端 (clientId -> requestId)
+const VCP_ASYNC_RESULTS_DIR = path.join(__dirname, 'VCPAsyncResults');
 
 function generateClientId() {
     // 用于生成客户端ID和请求ID
@@ -32,12 +40,74 @@ async function writeLog(message) {
     }
 }
 
+async function ensureAsyncResultsDir() {
+    try {
+        await fs.mkdir(VCP_ASYNC_RESULTS_DIR, { recursive: true });
+    } catch (error) {
+        console.error(`[WebSocketServer] Failed to create VCPAsyncResults directory: ${VCP_ASYNC_RESULTS_DIR}`, error);
+    }
+}
+
+async function handleDistributedPluginCallback(serverId, message) {
+    const callbackData = message?.data?.callbackData;
+    if (!callbackData || typeof callbackData !== 'object') {
+        writeLog(`Invalid plugin_callback_forward payload from server ${serverId}.`);
+        return;
+    }
+
+    const pluginName = callbackData.pluginName || callbackData.PLUGIN_NAME_FOR_CALLBACK;
+    const taskId = callbackData.taskId || callbackData.task_id || callbackData.TaskId;
+
+    if (!pluginName || !taskId) {
+        writeLog(`Distributed plugin callback missing pluginName or taskId from server ${serverId}.`);
+        return;
+    }
+
+    if (serverConfig.debugMode) {
+        console.log(`[WebSocketServer] Received distributed callback for plugin: ${pluginName}, taskId: ${taskId}, serverId: ${serverId}`);
+    }
+
+    await ensureAsyncResultsDir();
+    const resultFilePath = path.join(VCP_ASYNC_RESULTS_DIR, `${pluginName}-${taskId}.json`);
+    try {
+        await fs.writeFile(resultFilePath, JSON.stringify(callbackData, null, 2), 'utf-8');
+        if (serverConfig.debugMode) {
+            console.log(`[WebSocketServer] Saved distributed async result for ${pluginName}-${taskId} to ${resultFilePath}`);
+        }
+    } catch (fileError) {
+        console.error(`[WebSocketServer] Error saving distributed async result file for ${pluginName}-${taskId}:`, fileError);
+    }
+
+    const pluginManifest = pluginManager.getPlugin(pluginName);
+    if (!pluginManifest) {
+        console.error(`[WebSocketServer] Plugin manifest not found for distributed callback: ${pluginName}`);
+        return;
+    }
+
+    if (pluginManifest.webSocketPush && pluginManifest.webSocketPush.enabled) {
+        const targetClientType = pluginManifest.webSocketPush.targetClientType || null;
+        const wsMessage = {
+            type: pluginManifest.webSocketPush.messageType || 'plugin_callback_notification',
+            data: callbackData
+        };
+        broadcast(wsMessage, targetClientType);
+        if (serverConfig.debugMode) {
+            console.log(`[WebSocketServer] Distributed callback WebSocket push for ${pluginName} (taskId: ${taskId}) processed.`);
+        }
+    } else if (serverConfig.debugMode) {
+        console.log(`[WebSocketServer] WebSocket push not configured or disabled for distributed callback plugin: ${pluginName}`);
+    }
+}
+
 function initialize(httpServer, config) {
     if (!httpServer) {
         console.error('[WebSocketServer] Cannot initialize without an HTTP server instance.');
         return;
     }
     serverConfig = { ...serverConfig, ...config };
+    attachedHttpServer = httpServer;
+    isDraining = false;
+    shutdownPromise = null;
 
     if (!serverConfig.vcpKey && serverConfig.debugMode) {
         console.warn('[WebSocketServer] VCP_Key not set. WebSocket connections will not be authenticated if default path is used.');
@@ -45,7 +115,17 @@ function initialize(httpServer, config) {
 
     wssInstance = new WebSocket.Server({ noServer: true });
 
-    httpServer.on('upgrade', (request, socket, head) => {
+    upgradeHandler = (request, socket, head) => {
+        if (isDraining) {
+            writeLog(`Rejecting WebSocket upgrade during draining: ${request.url}`);
+            try {
+                socket.destroy();
+            } catch (e) {
+                // ignore
+            }
+            return;
+        }
+
         const parsedUrl = url.parse(request.url, true);
         const pathname = parsedUrl.pathname;
 
@@ -182,7 +262,9 @@ function initialize(httpServer, config) {
                 wssInstance.emit('connection', ws, request);
             });
         }
-    });
+    };
+
+    httpServer.on('upgrade', upgradeHandler);
 
     wssInstance.on('connection', (ws, request) => {
         if (serverConfig.debugMode) {
@@ -213,8 +295,8 @@ function initialize(httpServer, config) {
             try {
                 const parsedMessage = JSON.parse(message);
                 
-                // 强制日志：ChromeObserver 的消息
-                if (ws.clientType === 'ChromeObserver') {
+                // ChromeObserver 的消息日志降级到 debugMode
+                if (ws.clientType === 'ChromeObserver' && serverConfig.debugMode) {
                     console.log(`[WebSocketServer] 📨 收到 ChromeObserver 消息，类型: ${parsedMessage.type}`);
                 }
                 
@@ -267,15 +349,21 @@ function initialize(httpServer, config) {
 
                             // 新增：检查是否有等待的Control客户端，并转发页面信息
                             if (parsedMessage.type === 'pageInfoUpdate') {
-                                console.log(`[WebSocketServer] 🔔 收到 pageInfoUpdate, 当前等待客户端数: ${waitingControlClients.size}`);
+                                if (serverConfig.debugMode) {
+                                    console.log(`[WebSocketServer] 🔔 收到 pageInfoUpdate, 当前等待客户端数: ${waitingControlClients.size}`);
+                                }
                                 
                                 if (waitingControlClients.size > 0) {
                                     const pageInfoMarkdown = parsedMessage.data.markdown;
-                                    console.log(`[WebSocketServer] 📤 准备转发页面信息，markdown 长度: ${pageInfoMarkdown?.length || 0}`);
+                                    if (serverConfig.debugMode) {
+                                        console.log(`[WebSocketServer] 📤 准备转发页面信息，markdown 长度: ${pageInfoMarkdown?.length || 0}`);
+                                    }
                                     
                                     // 遍历所有等待的客户端
                                     waitingControlClients.forEach((requestId, clientId) => {
-                                        console.log(`[WebSocketServer] 🎯 尝试转发给客户端 ${clientId}, requestId: ${requestId}`);
+                                        if (serverConfig.debugMode) {
+                                            console.log(`[WebSocketServer] 🎯 尝试转发给客户端 ${clientId}, requestId: ${requestId}`);
+                                        }
                                         const messageForControl = {
                                             type: 'page_info_update',
                                             data: {
@@ -285,15 +373,21 @@ function initialize(httpServer, config) {
                                         };
                                         const sent = sendMessageToClient(clientId, messageForControl);
                                         if (sent) {
-                                            console.log(`[WebSocketServer] ✅ 成功转发页面信息给客户端 ${clientId}`);
+                                            if (serverConfig.debugMode) {
+                                                console.log(`[WebSocketServer] ✅ 成功转发页面信息给客户端 ${clientId}`);
+                                            }
                                             // 发送后即从等待列表移除
                                             waitingControlClients.delete(clientId);
                                         } else {
-                                            console.log(`[WebSocketServer] ❌ 转发失败，客户端 ${clientId} 可能已断开`);
+                                            if (serverConfig.debugMode) {
+                                                console.log(`[WebSocketServer] ❌ 转发失败，客户端 ${clientId} 可能已断开`);
+                                            }
                                         }
                                     });
                                 } else {
-                                    console.log(`[WebSocketServer] ⚠️ 收到 pageInfoUpdate 但没有等待的客户端`);
+                                    if (serverConfig.debugMode) {
+                                        console.log(`[WebSocketServer] ⚠️ 收到 pageInfoUpdate 但没有等待的客户端`);
+                                    }
                                 }
                             }
                         }
@@ -426,21 +520,60 @@ function sendMessageToClient(clientId, data) {
     return false;
 }
 
+async function beginDrain() {
+    if (isDraining) {
+        return;
+    }
+
+    isDraining = true;
+    writeLog('WebSocketServer entered draining mode.');
+
+    if (attachedHttpServer && upgradeHandler) {
+        attachedHttpServer.off('upgrade', upgradeHandler);
+        writeLog('WebSocket upgrade handler detached from HTTP server.');
+    }
+}
+
 function shutdown() {
-    if (serverConfig.debugMode) {
-        console.log('[WebSocketServer] Shutting down...');
+    if (shutdownPromise) {
+        return shutdownPromise;
     }
-    if (wssInstance) {
-        wssInstance.clients.forEach(client => {
-            client.close();
-        });
-        wssInstance.close(() => {
-            if (serverConfig.debugMode) {
-                console.log('[WebSocketServer] Server closed.');
-            }
-        });
-    }
-    writeLog('WebSocketServer shutdown.');
+
+    shutdownPromise = (async () => {
+        if (serverConfig.debugMode) {
+            console.log('[WebSocketServer] Shutting down...');
+        }
+
+        await beginDrain();
+
+        if (wssInstance) {
+            await new Promise((resolve) => {
+                try {
+                    wssInstance.clients.forEach(client => {
+                        try {
+                            client.close();
+                        } catch (e) {
+                            // ignore
+                        }
+                    });
+
+                    wssInstance.close(() => {
+                        if (serverConfig.debugMode) {
+                            console.log('[WebSocketServer] Server closed.');
+                        }
+                        resolve();
+                    });
+                } catch (error) {
+                    console.error('[WebSocketServer] Error during shutdown:', error);
+                    resolve();
+                }
+            });
+        }
+
+        writeLog('WebSocketServer shutdown.');
+    })();
+
+    return shutdownPromise;
 }
 
 // --- 新增分布式服务器相关函数 ---
@@ -450,7 +583,7 @@ function setPluginManager(pm) {
     if (serverConfig.debugMode) console.log('[WebSocketServer] PluginManager instance has been set.');
 }
 
-function handleDistributedServerMessage(serverId, message) {
+async function handleDistributedServerMessage(serverId, message) {
     if (!pluginManager) {
         console.error('[WebSocketServer] PluginManager not set, cannot handle distributed server message.');
         return;
@@ -511,6 +644,9 @@ function handleDistributedServerMessage(serverId, message) {
                 }
                 pendingToolRequests.delete(message.data.requestId);
             }
+            break;
+        case 'plugin_callback_forward':
+            await handleDistributedPluginCallback(serverId, message);
             break;
         default:
             writeLog(`Unknown message type '${message.type}' from server ${serverId}.`);
@@ -589,6 +725,7 @@ function broadcastToAdminPanel(data) {
 
 module.exports = {
     initialize,
+    beginDrain,
     setPluginManager,
     broadcast,
     broadcastVCPInfo, // 导出新的广播函数
