@@ -24,6 +24,7 @@ export type AppRouteId =
   | "agent-scores"
   | "toolbox-manager"
   | "tvs-files-editor"
+  | "sar-prompt-editor"
   | "tool-list-editor"
   | "preprocessor-order-manager"
   | "tool-approval-manager"
@@ -32,6 +33,7 @@ export type AppRouteId =
   | "schedule-manager"
   | "dream-manager"
   | "server-log-viewer"
+  | "final-context-viewer"
   | "placeholder-viewer"
   | "plugins"
   | "plugin-store"
@@ -101,6 +103,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/server-log-viewer",
     title: "服务器日志",
     icon: "terminal",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
+    id: "final-context-viewer",
+    routeName: "FinalContextViewer",
+    path: "/final-context-viewer",
+    title: "最终上下文处理",
+    icon: "schema",
     requiresAuth: true,
     navGroup: "core",
     showInSidebar: true,
@@ -274,6 +286,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/tvs-files-editor",
     title: "高级变量编辑器",
     icon: "data_object",
+    requiresAuth: true,
+    navGroup: "toolsPlugins",
+    showInSidebar: true,
+  },
+  {
+    id: "sar-prompt-editor",
+    routeName: "SarPromptEditor",
+    path: "/sar-prompt-editor",
+    title: "多模型提示词管理",
+    icon: "settings_suggest",
     requiresAuth: true,
     navGroup: "toolsPlugins",
     showInSidebar: true,

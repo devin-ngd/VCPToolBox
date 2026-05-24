@@ -7,6 +7,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const finalContextStore = require('./finalContextStore.js');
 
 // 🌟 核心网络优化：引入防御性长连接池 (Keep-Alive Pool)
 // 解决 "-1s Socket Hang Up" 与上游代理秒断僵尸连接的问题
@@ -29,6 +30,176 @@ const ToolCallParser = require('./vcpLoop/toolCallParser');
 const ToolExecutor = require('./vcpLoop/toolExecutor');
 const StreamHandler = require('./handlers/streamHandler');
 const NonStreamHandler = require('./handlers/nonStreamHandler');
+
+const VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER = '[[VCPToolUse=Forbidden]]';
+
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  return String(value).toLowerCase() === 'true';
+}
+
+function normalizeClientIp(ip) {
+  if (ip && ip.substr(0, 7) === '::ffff:') {
+    return ip.substr(7);
+  }
+  return ip || 'unknown';
+}
+
+class ResponseReplayCache {
+  constructor({ enabled = false, maxEntries = 100, debugMode = false } = {}) {
+    this.enabled = enabled;
+    this.maxEntries = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.floor(maxEntries) : 100;
+    this.debugMode = debugMode;
+    this.cache = new Map();
+  }
+
+  buildKey(clientIp, messageId) {
+    if (!this.enabled || !messageId) return null;
+    return `${normalizeClientIp(clientIp)}::${String(messageId)}`;
+  }
+
+  get(key) {
+    if (!this.enabled || !key || !this.cache.has(key)) return null;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+
+  set(key, entry) {
+    if (!this.enabled || !key || !entry || !Array.isArray(entry.chunks) || entry.chunks.length === 0) return;
+    if (this.cache.has(key)) this.cache.delete(key);
+    this.cache.set(key, {
+      ...entry,
+      chunks: entry.chunks.map(chunk => Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk))),
+      cachedAt: Date.now()
+    });
+
+    while (this.cache.size > this.maxEntries) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+    }
+
+    if (this.debugMode) {
+      console.log(`[ResponseReplayCache] Cached response for key=${key}. entries=${this.cache.size}/${this.maxEntries}`);
+    }
+  }
+
+  replay(key, req, res) {
+    const entry = this.get(key);
+    if (!entry) return false;
+
+    if (this.debugMode) {
+      console.log(`[ResponseReplayCache] Replaying cached response for key=${key}. No tool chain will be executed.`);
+    }
+
+    if (!res.headersSent) {
+      res.status(entry.statusCode || 200);
+      for (const [name, value] of Object.entries(entry.headers || {})) {
+        if (value !== undefined && value !== null) {
+          res.setHeader(name, value);
+        }
+      }
+    }
+
+    for (const chunk of entry.chunks) {
+      if (res.writableEnded || res.destroyed) break;
+      res.write(chunk);
+    }
+
+    if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
+
+    return true;
+  }
+}
+
+function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, streamMode, debugMode }) {
+  if (!cache?.enabled || !cacheKey || res.__vcpReplayCacheRecorderInstalled) {
+    return () => {};
+  }
+
+  res.__vcpReplayCacheRecorderInstalled = true;
+
+  const capturedChunks = [];
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  let finalized = false;
+
+  const captureChunk = (chunk, encoding) => {
+    if (chunk === undefined || chunk === null) return;
+    if (Buffer.isBuffer(chunk)) {
+      capturedChunks.push(Buffer.from(chunk));
+    } else {
+      capturedChunks.push(Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : 'utf8'));
+    }
+  };
+
+  res.write = function patchedWrite(chunk, encoding, callback) {
+    captureChunk(chunk, encoding);
+    return originalWrite(chunk, encoding, callback);
+  };
+
+  res.end = function patchedEnd(chunk, encoding, callback) {
+    captureChunk(chunk, encoding);
+    return originalEnd(chunk, encoding, callback);
+  };
+
+  const finalize = () => {
+    if (finalized) return;
+    finalized = true;
+
+    const statusCode = res.statusCode || 200;
+    if (statusCode >= 200 && statusCode < 500 && capturedChunks.length > 0) {
+      cache.set(cacheKey, {
+        id,
+        clientIp,
+        streamMode,
+        statusCode,
+        headers: res.getHeaders ? res.getHeaders() : {},
+        chunks: capturedChunks
+      });
+    } else if (debugMode) {
+      console.log(`[ResponseReplayCache] Skip caching key=${cacheKey}, status=${statusCode}, chunks=${capturedChunks.length}`);
+    }
+  };
+
+  res.once('finish', finalize);
+
+  return finalize;
+}
+
+/**
+ * 从顶层 system 提示词中检测并移除 VCP 工具禁用占位符。
+ * 只扫描首个连续 system 消息区间，避免普通上下文/用户内容误触发。
+ * @param {Array} messages
+ * @returns {boolean}
+ */
+function consumeVcpToolUseForbiddenPlaceholder(messages) {
+  if (!Array.isArray(messages)) return false;
+
+  let found = false;
+  for (const msg of messages) {
+    if (!msg || msg.role !== 'system') break;
+
+    if (typeof msg.content === 'string') {
+      if (msg.content.includes(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)) {
+        found = true;
+        msg.content = msg.content.split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER).join('');
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part?.type === 'text' && typeof part.text === 'string' && part.text.includes(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)) {
+          found = true;
+          part.text = part.text.split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER).join('');
+        }
+      }
+    }
+  }
+
+  return found;
+}
 
 /**
  * 检测工具返回结果是否为错误
@@ -332,6 +503,11 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
 class ChatCompletionHandler {
   constructor(config) {
     this.config = config;
+    this.responseReplayCache = new ResponseReplayCache({
+      enabled: parseBooleanEnv(config.responseReplayCacheEnabled ?? process.env.ResponseReplayCacheEnabled, false),
+      maxEntries: parseInt(config.responseReplayCacheMaxEntries ?? process.env.ResponseReplayCacheMaxEntries, 10) || 100,
+      debugMode: config.DEBUG_MODE
+    });
     this.toolExecutor = new ToolExecutor({
       pluginManager: config.pluginManager,
       webSocketServer: config.webSocketServer,
@@ -372,16 +548,33 @@ class ChatCompletionHandler {
 
     const shouldShowVCP = SHOW_VCP_OUTPUT || forceShowVCP;
 
-    let clientIp = req.ip;
-    if (clientIp && clientIp.substr(0, 7) === '::ffff:') {
-      clientIp = clientIp.substr(7);
-    }
+    let clientIp = normalizeClientIp(req.ip);
 
     const id = req.body.requestId || req.body.messageId;
+    let originalBody = req.body;
+    const isOriginalRequestStreaming = originalBody.stream === true;
+    const responseCacheKey = this.responseReplayCache.buildKey(clientIp, id);
+
+    if (responseCacheKey && this.responseReplayCache.replay(responseCacheKey, req, res)) {
+      return;
+    }
+
     const abortController = new AbortController();
 
     let clientDisconnectedAbortReason = null;
     let cleanupClientDisconnectListeners = () => {};
+    let finalizeResponseCacheRecorder = () => {};
+
+    if (responseCacheKey) {
+      finalizeResponseCacheRecorder = installResponseCacheRecorder(res, {
+        cache: this.responseReplayCache,
+        cacheKey: responseCacheKey,
+        id,
+        clientIp,
+        streamMode: isOriginalRequestStreaming,
+        debugMode: DEBUG_MODE
+      });
+    }
 
     if (id) {
       activeRequests.set(id, {
@@ -438,9 +631,6 @@ class ChatCompletionHandler {
         res.off('close', onResClose);
       };
     }
-
-    let originalBody = req.body;
-    const isOriginalRequestStreaming = originalBody.stream === true;
 
     // --- 上下文控制 (Context Control) ---
     // 1. 拦截 contextTokenLimit 参数
@@ -506,6 +696,11 @@ class ChatCompletionHandler {
           skipCount: 1
         });
         if (DEBUG_MODE) await writeDebugLog('LogAfterInitialRoleDivider', originalBody.messages);
+      }
+
+      const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(originalBody.messages);
+      if (vcpToolUseForbidden && DEBUG_MODE) {
+        console.log(`[VCPToolUse] Detected ${VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER} in top-level system prompt. Tool parsing/execution is disabled for this request.`);
       }
 
       let shouldProcessMedia = false;
@@ -701,9 +896,18 @@ class ChatCompletionHandler {
       });
 
       originalBody.messages = processedMessages;
-      await writeDebugLog('LogOutputAfterProcessing', originalBody);
-
       const willStreamResponse = isOriginalRequestStreaming;
+      const finalUpstreamBody = { ...originalBody, stream: willStreamResponse };
+
+      finalContextStore.setLastFinalContext(finalUpstreamBody, {
+        requestId: req.body.requestId || null,
+        messageId: req.body.messageId || null,
+        clientIp,
+        forceShowVCP,
+        capturedStage: 'before_upstream_fetch'
+      });
+
+      await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
 
       let firstAiAPIResponse = await fetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
@@ -715,7 +919,7 @@ class ChatCompletionHandler {
             ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
             Accept: willStreamResponse ? 'text/event-stream' : req.headers['accept'] || 'application/json',
           },
-          body: JSON.stringify({ ...originalBody, stream: willStreamResponse }),
+          body: JSON.stringify(finalUpstreamBody),
           signal: abortController.signal,
         },
         {
@@ -830,7 +1034,8 @@ class ChatCompletionHandler {
         _refreshRagBlocksIfNeeded,
         fetchWithRetry,
         isToolResultError,
-        formatToolResult
+        formatToolResult,
+        vcpToolUseForbidden
       };
 
       if (isUpstreamStreaming) {
@@ -926,6 +1131,12 @@ class ChatCompletionHandler {
       }
     } finally {
       cleanupClientDisconnectListeners();
+
+      if (!res.writableEnded && !res.destroyed) {
+        // 仍未结束的异常路径不应写入缓存；正常 finish 会自动 finalize。
+      } else {
+        finalizeResponseCacheRecorder();
+      }
 
       if (id) {
         const requestData = activeRequests.get(id);
