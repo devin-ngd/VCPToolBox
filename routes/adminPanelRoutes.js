@@ -10,12 +10,18 @@ module.exports = function (
   DEBUG_MODE,
   dailyNoteRootPath,
   pluginManager,
+  knowledgeRootPath,
   getCurrentServerLogPath,
   vectorDBManager,
   agentDirPath,
   cachedEmojiLists,
   tvsDirPath,
-  triggerRestart
+  triggerRestart,
+  semanticModelRouter,
+  modelRedirectHandler,
+  apiUrl,
+  apiKey,
+  tdbKnowledgeManager
 ) {
   if (!agentDirPath || typeof agentDirPath !== "string") {
     throw new Error(
@@ -38,12 +44,18 @@ module.exports = function (
     DEBUG_MODE,
     dailyNoteRootPath,
     pluginManager,
+    knowledgeRootPath,
     getCurrentServerLogPath,
     vectorDBManager,
     agentDirPath,
     cachedEmojiLists,
     tvsDirPath,
     triggerRestart,
+    semanticModelRouter,
+    modelRedirectHandler,
+    apiUrl,
+    apiKey,
+    tdbKnowledgeManager,
   };
 
   /**
@@ -81,18 +93,27 @@ module.exports = function (
   mount("/", "agents"); // Handles /agents/*
   mount("/", "tvs"); // Handles /tvsvars/*
   mount("/", "placeholders"); // Handles /placeholders
+  mount("/", "placeholderExplorer"); // Handles /placeholder-explorer/*
   mount("/", "schedules"); // Handles /schedules/*
   mount("/", "rag"); // Handles /rag-tags, /rag-params, /available-clusters, etc.
   mount("/", "agentAssistant"); // Handles /agent-assistant/*
+  mount("/", "aiChat"); // Handles /ai/*
+  mount("/", "openHerPersona"); // Handles /openher-persona/*
   mount("/", "taskAssistant"); // Handles /task-assistant/*
   mount("/", "toolListEditor"); // Handles /tool-list/*
-    mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "semanticRouter"); // Handles /semantic-router/*
   mount("/", "dream"); // Handles /dream-logs/*, /dream-operation/*
   mount("/", "dailyNotes"); // Wrapper for existing dailyNotesRoutes (Handles /dailynotes/*)
   mount("/", "newapiMonitor"); // Handles /newapi-monitor/*
   mount("/", "sarPrompts"); // Handles /sarprompts/*
   mount("/", "emojis"); // Handles /emojis/*
   mount("/", "pluginStore"); // Handles /plugin-store/*
+  mount("/", "bridgeProfiles"); // Handles /bridge-profiles/*
+  mount("/", "multimodalConfig"); // Handles /multimodal-config (JSON 真相源 + 热更新)
+  mount("/", "clawMail"); // Handles /claw-mail/*
+  mount("/", "tarotDivination"); // Handles /tarot-divination/*
+  mount("/", "toolCallRecords"); // Handles /tool-call-records/*
 
   return adminApiRouter;
 };

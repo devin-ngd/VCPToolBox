@@ -1,4 +1,7 @@
-import type { RouteLocationNormalizedLoaded, RouteLocationRaw } from "vue-router";
+import type {
+  RouteLocationNormalizedLoaded,
+  RouteLocationRaw,
+} from "vue-router";
 import type { PluginInfo } from "@/types/api.plugin";
 
 export type AppRouteGroup =
@@ -11,8 +14,10 @@ export type AppRouteId =
   | "login"
   | "dashboard"
   | "base-config"
+  | "theme-editor"
   | "dynamic-tools-manager"
   | "daily-notes-manager"
+  | "knowledge-base-manager"
   | "vcp-forum"
   | "image-cache-editor"
   | "emoji-gallery"
@@ -20,6 +25,10 @@ export type AppRouteId =
   | "vcptavern-editor"
   | "agent-files-editor"
   | "agent-assistant-config"
+  | "onering-manager"
+  | "agent-timeline-manager"
+  | "claw-mail-manager"
+  | "agent-emotion-manager"
   | "forum-assistant-config"
   | "agent-scores"
   | "toolbox-manager"
@@ -28,13 +37,17 @@ export type AppRouteId =
   | "tool-list-editor"
   | "preprocessor-order-manager"
   | "tool-approval-manager"
+  | "tool-call-records-manager"
   | "thinking-chains-editor"
   | "rag-tuning"
   | "schedule-manager"
   | "dream-manager"
   | "server-log-viewer"
+  | "semantic-model-router-editor"
   | "final-context-viewer"
+  | "bridge-hijack-config"
   | "placeholder-viewer"
+  | "placeholder-explorer-manager"
   | "plugins"
   | "plugin-store"
   | "plugin-config";
@@ -98,6 +111,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     showInSidebar: true,
   },
   {
+    id: "theme-editor",
+    routeName: "ThemeEditor",
+    path: "/theme-editor",
+    title: "主题编辑器",
+    icon: "palette",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
     id: "server-log-viewer",
     routeName: "ServerLogViewer",
     path: "/server-log-viewer",
@@ -108,11 +131,31 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     showInSidebar: true,
   },
   {
+    id: "semantic-model-router-editor",
+    routeName: "SemanticModelRouterEditor",
+    path: "/semantic-model-router-editor",
+    title: "语义模型路由器",
+    icon: "route",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
     id: "final-context-viewer",
     routeName: "FinalContextViewer",
     path: "/final-context-viewer",
     title: "最终上下文处理",
     icon: "schema",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
+    id: "bridge-hijack-config",
+    routeName: "BridgeHijackConfig",
+    path: "/bridge-hijack-config",
+    title: "前端劫持配置",
+    icon: "settings_input_component",
     requiresAuth: true,
     navGroup: "core",
     showInSidebar: true,
@@ -134,6 +177,46 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/agent-assistant-config",
     title: "Agent 通讯配置",
     icon: "diversity_3",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "onering-manager",
+    routeName: "OneRingManager",
+    path: "/onering-manager",
+    title: "OneRing 管理",
+    icon: "all_inclusive",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "agent-timeline-manager",
+    routeName: "AgentTimeLineManager",
+    path: "/agent-timeline-manager",
+    title: "Agent TimeLine",
+    icon: "timeline",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "claw-mail-manager",
+    routeName: "ClawMailManager",
+    path: "/claw-mail-manager",
+    title: "Agent 信箱",
+    icon: "mark_email_unread",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "agent-emotion-manager",
+    routeName: "AgentEmotionManager",
+    path: "/agent-emotion-manager",
+    title: "Agent 情绪管理",
+    icon: "neurology",
     requiresAuth: true,
     navGroup: "agentContent",
     showInSidebar: true,
@@ -223,8 +306,18 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     id: "daily-notes-manager",
     routeName: "DailyNotesManager",
     path: "/daily-notes-manager",
-    title: "日记知识库管理",
+    title: "日记管理",
     icon: "description",
+    requiresAuth: true,
+    navGroup: "knowledge",
+    showInSidebar: true,
+  },
+  {
+    id: "knowledge-base-manager",
+    routeName: "KnowledgeBaseManager",
+    path: "/knowledge-base-manager",
+    title: "知识库管理",
+    icon: "library_books",
     requiresAuth: true,
     navGroup: "knowledge",
     showInSidebar: true,
@@ -331,6 +424,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     showInSidebar: true,
   },
   {
+    id: "tool-call-records-manager",
+    routeName: "ToolCallRecordsManager",
+    path: "/tool-call-records-manager",
+    title: "插件调用记录管理",
+    icon: "receipt_long",
+    requiresAuth: true,
+    navGroup: "toolsPlugins",
+    showInSidebar: true,
+  },
+  {
     id: "plugins",
     routeName: "PluginsHub",
     path: "/plugins",
@@ -356,6 +459,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/placeholder-viewer",
     title: "占位符查看器",
     icon: "view_list",
+    requiresAuth: true,
+    navGroup: "toolsPlugins",
+    showInSidebar: true,
+  },
+  {
+    id: "placeholder-explorer-manager",
+    routeName: "PlaceholderExplorerManager",
+    path: "/placeholder-explorer-manager",
+    title: "占位符索引管理",
+    icon: "account_tree",
     requiresAuth: true,
     navGroup: "toolsPlugins",
     showInSidebar: true,
@@ -388,7 +501,9 @@ const APP_ROUTE_BY_PATH = new Map(
 );
 
 export function getAppRouteMetaById(routeId: AppRouteId): AppRouteMeta {
-  return APP_ROUTE_BY_ID.get(routeId) ?? APP_ROUTE_BY_ID.get(APP_DEFAULT_ROUTE_ID)!;
+  return (
+    APP_ROUTE_BY_ID.get(routeId) ?? APP_ROUTE_BY_ID.get(APP_DEFAULT_ROUTE_ID)!
+  );
 }
 
 export function isAppRouteId(value: string): value is AppRouteId {

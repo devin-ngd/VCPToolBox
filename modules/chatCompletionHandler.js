@@ -9,6 +9,14 @@ const http = require('http');
 const https = require('https');
 const finalContextStore = require('./finalContextStore.js');
 
+// 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
+let multiModalConfigStore = null;
+try {
+  multiModalConfigStore = require('./multiModalConfigStore.js');
+} catch (storeError) {
+  multiModalConfigStore = null;
+}
+
 // 🌟 核心网络优化：引入防御性长连接池 (Keep-Alive Pool)
 // 解决 "-1s Socket Hang Up" 与上游代理秒断僵尸连接的问题
 const agentOptions = {
@@ -202,6 +210,75 @@ function consumeVcpToolUseForbiddenPlaceholder(messages) {
 }
 
 /**
+ * 检测当前真实后端模型是否命中纯文本模型 Tag 列表（不区分大小写）。
+ * 配合模型动态路由（VCPModelAuto / SemanticModelRouter）使用：
+ * 当语义路由切换到不支持多模态的模型（如 deepseek-v4 / GLM-4.5）时，
+ * 自动把 base64 翻译为文本，避免上游 API 报错或丢图。
+ *
+ * @param {string} modelName 真实后端模型名（已经过 ModelRedirect 与语义路由解析）
+ * @param {string[]} tagList tag 数组（已统一为小写，由 server.js 解析）
+ * @returns {boolean} 是否命中
+ */
+function isTextOnlyModelByTag(modelName, tagList) {
+  if (!modelName || !Array.isArray(tagList) || tagList.length === 0) return false;
+  const lowerName = String(modelName).toLowerCase();
+  for (const tag of tagList) {
+    if (!tag) continue;
+    if (lowerName.includes(tag)) return true;
+  }
+  return false;
+}
+
+/**
+ * 检测一条消息（或其 content 数组）中是否包含 base64 多模态部分。
+ * 仅用于 Force-Translate 触发判定，避免在没有图片/音视频的请求里空转翻译插件。
+ *
+ * @param {Array} messages 消息数组
+ * @returns {boolean}
+ */
+function messagesContainBase64Media(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const msg of messages) {
+    if (!msg || (msg.role !== 'user' && msg.role !== 'system')) continue;
+    if (!Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      if (
+        part &&
+        part.type === 'image_url' &&
+        part.image_url &&
+        typeof part.image_url.url === 'string' &&
+        /^data:(image|audio|video)\/[^;]+;base64,/.test(part.image_url.url)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Copy non-enumerable array metadata produced by upstream preprocessors.
+ * OneRing attaches __oneRingMeta to the messages array itself; any pipeline
+ * step that returns a fresh array must preserve it explicitly.
+ */
+function copyArrayMetadata(source, target) {
+  if (!Array.isArray(source) || !Array.isArray(target)) return target;
+
+  for (const key of Object.getOwnPropertyNames(source)) {
+    if (/^(?:length|\d+)$/.test(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (!descriptor) continue;
+    try {
+      Object.defineProperty(target, key, descriptor);
+    } catch (e) {
+      // Metadata preservation is best-effort and must not break request flow.
+    }
+  }
+
+  return target;
+}
+
+/**
  * 检测工具返回结果是否为错误
  * @param {any} result - 工具返回的结果
  * @returns {boolean} - 是否为错误结果
@@ -213,23 +290,36 @@ function isToolResultError(result) {
 
   // 1. 对象形式的错误检测
   if (typeof result === 'object') {
-    // 检查常见的错误标识字段
-    if (result.error === true ||
+    // 判定顺序必须先看明确成功标志：
+    // 工具成功返回的正文/嵌套字段里可能包含“拒绝/错误/error”等业务文本，不能因此覆盖 status: success。
+    if (
+      result.success === true ||
+      result.status === 'success' ||
+      result.status === 'ok' ||
+      result.ok === true
+    ) {
+      return false;
+    }
+
+    // 然后只信任结构化失败字段。
+    if (
+      result.error === true ||
       result.success === false ||
       result.status === 'error' ||
       result.status === 'failed' ||
-      result.code?.toString().startsWith('4') || // 4xx 错误码
-      result.code?.toString().startsWith('5')) { // 5xx 错误码
+      result.status === 'failure' ||
+      result.ok === false
+    ) {
       return true;
     }
 
-    // 对象转字符串后检查
-    try {
-      const jsonStr = JSON.stringify(result).toLowerCase();
-      return jsonStr.includes('"error"') && !jsonStr.includes('"error":false');
-    } catch (e) {
-      return false;
+    const codeValue = result.code ?? result.statusCode ?? result.httpStatus;
+    const numericCode = Number(codeValue);
+    if (Number.isFinite(numericCode) && numericCode >= 400 && numericCode < 600) {
+      return true;
     }
+
+    return false;
   }
 
   // 2. 字符串形式的错误检测（模糊匹配）
@@ -246,10 +336,8 @@ function isToolResultError(result) {
       }
     }
 
-    // 模糊匹配（需要更谨慎）
-    // 只有在明确包含"错误"或"失败"这类强指示词时才认为是错误
-    if (result.includes('错误') || result.includes('失败') ||
-      lowerResult.includes('error:') || lowerResult.includes('failed:')) {
+    // 字符串仅接受显式错误前缀/格式，不再因正文任意位置包含“错误/失败/拒绝”等业务文本而误判。
+    if (lowerResult.includes('error:') || lowerResult.includes('failed:')) {
       return true;
     }
   }
@@ -285,15 +373,50 @@ async function getRealAuthCode(debugMode = false) {
   }
 }
 
+function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMode = false) {
+  if (!Array.isArray(candidates) || candidates.length === 0 || !options || typeof options.body !== 'string') {
+    return options;
+  }
+
+  const selectedModel = candidates[Math.min(attemptIndex, candidates.length - 1)];
+  if (!selectedModel) return options;
+
+  try {
+    const parsedBody = JSON.parse(options.body);
+    if (!parsedBody || typeof parsedBody !== 'object') return options;
+
+    const previousModel = parsedBody.model;
+    parsedBody.model = selectedModel;
+
+    if (debugMode && previousModel !== selectedModel) {
+      console.log(`[SemanticModelRouter] 容灾切换上游模型: ${previousModel} -> ${selectedModel} (attempt=${attemptIndex + 1})`);
+    }
+
+    return {
+      ...options,
+      body: JSON.stringify(parsedBody)
+    };
+  } catch (error) {
+    if (debugMode) {
+      console.warn(`[SemanticModelRouter] 无法为本次重试替换模型，继续使用原始请求体: ${error.message}`);
+    }
+    return options;
+  }
+}
+
 // A helper function to handle fetch with retries for specific status codes
 // connectionTimeout: 连接超时安全网，防止上游 API 静默挂起导致永久等待（仅覆盖到收到响应头为止）
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 120000 } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
-  for (let i = 0; i < retries; i++) {
+  const maxAttempts = Math.max(
+    Number.isFinite(Number(retries)) && Number(retries) > 0 ? Math.floor(Number(retries)) : 1,
+    Array.isArray(modelFallbackCandidates) ? modelFallbackCandidates.length : 0
+  );
+  for (let i = 0; i < maxAttempts; i++) {
     // 为每次尝试创建独立的中止控制器，用于超时保护
     const attemptController = new AbortController();
     let didTimeout = false;
@@ -321,8 +444,9 @@ async function fetchWithRetry(
     };
 
     try {
+      const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
       const response = await fetch(url, {
-        ...options,
+        ...attemptOptions,
         agent: getFetchAgent, // 注入防御性长连接池
         signal: attemptController.signal,
       });
@@ -370,7 +494,7 @@ async function fetchWithRetry(
         if (didTimeout) {
           // 超时中止 → 视为可重试的网络错误
           const msg = `Connection timed out after ${connectionTimeout / 1000}s`;
-          if (i === retries - 1) {
+          if (i === maxAttempts - 1) {
             console.error(`[Fetch Retry] ${msg}. All retries exhausted.`);
             throw new Error(msg);
           }
@@ -386,7 +510,7 @@ async function fetchWithRetry(
         throw error;
       }
 
-      if (i === retries - 1) {
+      if (i === maxAttempts - 1) {
         console.error(`[Fetch Retry] All retries failed. Last error: ${error.message}`);
         throw error;
       }
@@ -403,6 +527,32 @@ async function fetchWithRetry(
   }
   throw new Error('Fetch failed after all retries.');
 }
+
+// 剥离 Markdown 代码块，避免 VCP Refresh 误扫源码示例中的伪 RAG 标签
+function stripMarkdownCodeFencesForRagRefresh(text) {
+  if (typeof text !== 'string') return '';
+  return text.replace(/```[\s\S]*?```/g, '');
+}
+
+// 安全解析 RAG metadata：必须是合法 JSON 对象，否则跳过（不抛错污染用户请求）
+function safeParseRagBlockMetadata(rawMetadata, debugMode = false) {
+  if (typeof rawMetadata !== 'string') return null;
+  const trimmed = rawMetadata.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    if (debugMode) console.warn(`[VCP Refresh] 跳过非 JSON metadata: ${trimmed.slice(0, 80)}`);
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch (e) {
+    if (debugMode) console.warn(`[VCP Refresh] metadata JSON 解析失败，跳过: ${e.message}`);
+    return null;
+  }
+}
+
 // 辅助函数：根据新上下文刷新对话历史中的RAG区块
 async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, debugMode = false) {
   const ragPlugin = pluginManager.messagePreprocessors?.get('RAGDiaryPlugin');
@@ -418,14 +568,15 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
   const newMessages = JSON.parse(JSON.stringify(messages));
   let hasRefreshed = false;
 
-  // 🟢 改进点1：使用更健壮的正则 [\s\S]*? 匹配跨行内容，并允许标签周围有空格
-  const ragBlockRegex = /<!-- VCP_RAG_BLOCK_START ([\s\S]*?) -->([\s\S]*?)<!-- VCP_RAG_BLOCK_END -->/g;
+  // metadata 只接受 JSON 对象，避免误匹配源码示例、正则模板和未渲染占位符。
+  const ragBlockRegex = /<!-- VCP_RAG_BLOCK_START\s+(\{[\s\S]*?\})\s+-->([\s\S]*?)<!-- VCP_RAG_BLOCK_END -->/g;
 
   for (let i = 0; i < newMessages.length; i++) {
     // 只处理 assistant 和 system 角色中的字符串内容
     // 🟢 改进点2：有些场景下 RAG 可能会被注入到 user 消息中，建议也检查 user
     if (['assistant', 'system', 'user'].includes(newMessages[i].role) && typeof newMessages[i].content === 'string') {
-      let messageContent = newMessages[i].content;
+      // 先剥离 Markdown 代码围栏，避免扫描到示例中的伪 RAG 标签。
+      let messageContent = stripMarkdownCodeFencesForRagRefresh(newMessages[i].content);
 
       // 快速检查是否存在标记，避免无效正则匹配
       if (!messageContent.includes('VCP_RAG_BLOCK_START')) {
@@ -447,8 +598,10 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
           const metadataJson = match[1];
 
           try {
-            // 🟢 改进点3：解析元数据时如果不严谨可能会报错，增加容错
-            const metadata = JSON.parse(metadataJson);
+            const metadata = safeParseRagBlockMetadata(metadataJson, debugMode);
+            if (!metadata) {
+              continue;
+            }
 
             if (debugMode) {
               console.log(`[VCP Refresh] 正在刷新区块 (${metadata.dbName})...`);
@@ -536,6 +689,7 @@ class ChatCompletionHandler {
       apiRetries,
       apiRetryDelay,
       RAGMemoRefresh,
+      apiConnectionTimeoutMs,
       enableRoleDivider, // 新增
       enableRoleDividerInLoop, // 新增
       roleDividerIgnoreList, // 新增
@@ -544,14 +698,63 @@ class ChatCompletionHandler {
       roleDividerRemoveDisabledTags, // 新增
       chinaModel1, // 新增
       chinaModel1Cot, // 新增
+      semanticModelRouter,
+      multiModalForceTranslateModels: configForceTranslateModels, // 启动时快照（ENV）作为兜底
     } = this.config;
 
+    // 优先从 multimodal-config.json 真相源拉取最新 tag 列表，失败时回退 ENV 快照
+    let multiModalForceTranslateModels = configForceTranslateModels;
+    if (multiModalConfigStore) {
+      try {
+        const liveTags = multiModalConfigStore.getForceTranslateModels();
+        if (Array.isArray(liveTags)) {
+          multiModalForceTranslateModels = liveTags;
+        }
+      } catch (storeReadErr) {
+        // 静默回退，不阻塞请求
+      }
+    }
+
     const shouldShowVCP = SHOW_VCP_OUTPUT || forceShowVCP;
+    const applyChinaModelThinkingControl = (body) => {
+      if (!body || !body.model || !chinaModel1 || !Array.isArray(chinaModel1) || chinaModel1.length === 0) {
+        return body;
+      }
+
+      const modelNameLower = String(body.model).toLowerCase();
+      const isChinaModel = chinaModel1.some(m => modelNameLower.includes(String(m).toLowerCase()));
+      if (!isChinaModel) return body;
+
+      if (chinaModel1Cot) {
+        body.thinking = { type: "enabled" };
+      } else {
+        delete body.thinking;
+      }
+
+      if (DEBUG_MODE) {
+        console.log(`[ChinaModel] 模型 '${body.model}' 匹配成功。思维链状态: ${chinaModel1Cot ? '开启 (enabled)' : '关闭 (已移除字段)'}`);
+      }
+
+      return body;
+    };
 
     let clientIp = normalizeClientIp(req.ip);
 
     const id = req.body.requestId || req.body.messageId;
     let originalBody = req.body;
+    const vcpchatExtensions = originalBody && typeof originalBody === 'object'
+      ? originalBody.vcpchatExtensions
+      : null;
+    if (vcpchatExtensions !== undefined) {
+      delete originalBody.vcpchatExtensions;
+      const bindingCount = Array.isArray(vcpchatExtensions?.messageTimestampBindings)
+        ? vcpchatExtensions.messageTimestampBindings.length
+        : 0;
+      console.log(`[VCPChatExtensions] Intercepted and stripped vcpchatExtensions before upstream forwarding. timestampBindings=${bindingCount}`);
+    }
+    const requestPreprocessorConfig = vcpchatExtensions
+      ? { vcpchatExtensions }
+      : {};
     const isOriginalRequestStreaming = originalBody.stream === true;
     const responseCacheKey = this.responseReplayCache.buildKey(clientIp, id);
 
@@ -657,46 +860,25 @@ class ChatCompletionHandler {
     try {
       if (originalBody.model) {
         const originalModel = originalBody.model;
-        const redirectedModel = modelRedirectHandler.redirectModelForBackend(originalModel);
-        if (redirectedModel !== originalModel) {
-          originalBody = { ...originalBody, model: redirectedModel };
-          console.log(`[ModelRedirect] 客户端请求模型 '${originalModel}' 已重定向为后端模型 '${redirectedModel}'`);
-        }
+        const isSemanticRoutingModel = semanticModelRouter && typeof semanticModelRouter.isRoutingModel === 'function'
+          ? semanticModelRouter.isRoutingModel(originalModel)
+          : false;
 
-        // --- 国产A类模型推理功能控制 (ChinaModel Thinking Control) ---
-        if (chinaModel1 && Array.isArray(chinaModel1) && chinaModel1.length > 0) {
-          const modelNameLower = originalBody.model.toLowerCase();
-          const isChinaModel = chinaModel1.some(m => modelNameLower.includes(m.toLowerCase()));
-          if (isChinaModel) {
-            if (chinaModel1Cot) {
-              originalBody.thinking = { type: "enabled" };
-            } else {
-              delete originalBody.thinking;
-            }
-
-            if (DEBUG_MODE) {
-              console.log(`[ChinaModel] 模型 '${originalBody.model}' 匹配成功。思维链状态: ${chinaModel1Cot ? '开启 (enabled)' : '关闭 (已移除字段)'}`);
-            }
+        if (!isSemanticRoutingModel) {
+          const redirectedModel = modelRedirectHandler.redirectModelForBackend(originalModel);
+          if (redirectedModel !== originalModel) {
+            originalBody = { ...originalBody, model: redirectedModel };
+            console.log(`[ModelRedirect] 客户端请求模型 '${originalModel}' 已重定向为后端模型 '${redirectedModel}'`);
           }
+
+          // --- 国产A类模型推理功能控制 (ChinaModel Thinking Control) ---
+          applyChinaModelThinkingControl(originalBody);
+        } else if (DEBUG_MODE) {
+          console.log(`[SemanticModelRouter] 检测到语义路由模型 '${originalModel}'，延后到消息预处理完成后选择真实后端模型。`);
         }
       }
 
       await writeDebugLog('LogInput', originalBody);
-
-      // --- 角色分割处理 (Role Divider) - 初始阶段 ---
-      // 移动到最前端，确保拆分出的楼层能享受后续所有解析功能
-      if (enableRoleDivider) {
-        if (DEBUG_MODE) console.log('[Server] Applying Role Divider processing (Initial Stage)...');
-        // skipCount: 1 to exclude the initial SystemPrompt from splitting
-        originalBody.messages = roleDivider.process(originalBody.messages, {
-          ignoreList: roleDividerIgnoreList,
-          switches: roleDividerSwitches,
-          scanSwitches: roleDividerScanSwitches,
-          removeDisabledTags: roleDividerRemoveDisabledTags,
-          skipCount: 1
-        });
-        if (DEBUG_MODE) await writeDebugLog('LogAfterInitialRoleDivider', originalBody.messages);
-      }
 
       const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(originalBody.messages);
       if (vcpToolUseForbidden && DEBUG_MODE) {
@@ -749,16 +931,78 @@ class ChatCompletionHandler {
       if (pluginManager.messagePreprocessors.has('VCPTavern')) {
         if (DEBUG_MODE) console.log(`[Server] Calling priority message preprocessor: VCPTavern`);
         try {
-          tavernProcessedMessages = await pluginManager.executeMessagePreprocessor('VCPTavern', originalBody.messages);
+          tavernProcessedMessages = await pluginManager.executeMessagePreprocessor('VCPTavern', originalBody.messages, requestPreprocessorConfig);
         } catch (pluginError) {
           console.error(`[Server] Error in priority preprocessor VCPTavern:`, pluginError);
         }
+      }
+
+      // --- 语义模型路由：在变量替换前确定真实后端模型 ---
+      // 这一步必须放在 VCPTavern 之后、变量替换之前：
+      // 1) 路由依据已经包含 Tavern 注入的最新 user/assistant 上下文，更贴近真实意图。
+      // 2) 在变量替换前完成，使后续的 SarPrompt、ChinaModel 等模型相关注入能针对真实路由模型生效。
+      let semanticRoutePlan = null;
+      let semanticModelFallbackCandidates = null;
+      if (semanticModelRouter && typeof semanticModelRouter.isRoutingModel === 'function' && semanticModelRouter.isRoutingModel(originalBody.model)) {
+        semanticRoutePlan = await semanticModelRouter.resolveRoute({
+          requestedModel: originalBody.model,
+          messages: tavernProcessedMessages,
+          pluginManager
+        });
+
+        if (semanticRoutePlan && semanticRoutePlan.active) {
+          const rawCandidates = Array.isArray(semanticRoutePlan.candidates) && semanticRoutePlan.candidates.length > 0
+            ? semanticRoutePlan.candidates
+            : [semanticRoutePlan.selectedModel];
+
+          semanticModelFallbackCandidates = rawCandidates
+            .map(model => modelRedirectHandler.redirectModelForBackend(model))
+            .filter(Boolean)
+            .filter((model, index, arr) => arr.indexOf(model) === index);
+
+          const selectedBackendModel = semanticModelFallbackCandidates[0] || modelRedirectHandler.redirectModelForBackend(semanticRoutePlan.selectedModel);
+          const previousModel = originalBody.model;
+          originalBody = { ...originalBody, model: selectedBackendModel };
+
+          if (DEBUG_MODE || previousModel !== selectedBackendModel) {
+            console.log(
+              `[SemanticModelRouter] 请求模型 '${previousModel}' 已路由到 '${selectedBackendModel}' ` +
+              `(preset=${semanticRoutePlan.presetName}, reason=${semanticRoutePlan.reason}, candidates=${semanticModelFallbackCandidates.join(' -> ')})`
+            );
+          }
+
+          applyChinaModelThinkingControl(originalBody);
+        }
+      }
+
+      // --- 纯文本模型强制翻译多模态 ---
+      // 当语义路由 / ModelRedirect 解析后的真实后端模型命中
+      // MultiModalForceTranslateModels 列表（不区分大小写、tag 子串匹配）时：
+      // 1) 自动开启多模态翻译（无视用户是否配置 {{TransBase64}}/{{TransBase64+}}）
+      // 2) 强制关闭 + 模式的 base64 还原（因为目标模型是纯文本模型，无法处理 base64）
+      // 3) 初始请求仍仅在消息确实含有 base64 多模态时执行翻译，避免空转翻译插件
+      // 4) 该标记也会传递给 VCP loop，用于工具回包后才出现 image_url 的情况
+      const isTextOnlyForceTranslateModel = Array.isArray(multiModalForceTranslateModels) &&
+        multiModalForceTranslateModels.length > 0 &&
+        isTextOnlyModelByTag(originalBody.model, multiModalForceTranslateModels);
+      if (
+        isTextOnlyForceTranslateModel &&
+        messagesContainBase64Media(tavernProcessedMessages)
+      ) {
+        const previousMode = shouldProcessMediaPlus ? 'TransBase64+' : (shouldProcessMedia ? 'TransBase64' : 'none');
+        shouldProcessMedia = true;
+        shouldProcessMediaPlus = false; // 关键：禁用还原 base64
+        console.log(
+          `[MultiModalForceTranslate] 模型 '${originalBody.model}' 命中纯文本模型 tag 列表，` +
+          `自动启用多模态文本翻译并禁用 base64 还原（先前模式: ${previousMode}）。`
+        );
       }
 
       // --- 统一处理所有变量替换 ---
       // 创建一个包含所有所需依赖的统一上下文
       const processingContext = {
         pluginManager,
+        webSocketServer,
         cachedEmojiLists: this.config.cachedEmojiLists,
         detectors: this.config.detectors,
         superDetectors: this.config.superDetectors,
@@ -824,7 +1068,7 @@ class ChatCompletionHandler {
         if (pluginManager.messagePreprocessors.has(processorName)) {
           if (DEBUG_MODE) console.log(`[Server] Calling message preprocessor: ${processorName}`);
           try {
-            processedMessages = await pluginManager.executeMessagePreprocessor(processorName, processedMessages);
+            processedMessages = await pluginManager.executeMessagePreprocessor(processorName, processedMessages, requestPreprocessorConfig);
           } catch (pluginError) {
             console.error(`[Server] Error in preprocessor ${processorName}:`, pluginError);
           }
@@ -838,7 +1082,7 @@ class ChatCompletionHandler {
 
         if (DEBUG_MODE) console.log(`[Server] Calling message preprocessor: ${name}`);
         try {
-          processedMessages = await pluginManager.executeMessagePreprocessor(name, processedMessages);
+          processedMessages = await pluginManager.executeMessagePreprocessor(name, processedMessages, requestPreprocessorConfig);
         } catch (pluginError) {
           console.error(`[Server] Error in preprocessor ${name}:`, pluginError);
         }
@@ -880,22 +1124,47 @@ class ChatCompletionHandler {
         if (DEBUG_MODE) console.log(`[Server] TransBase64+ cleanup and media restore complete.`);
       }
 
-      // 经过改造后，processedMessages 已经是最终版本，无需再调用 replaceOtherVariables
+      // --- Detector / SuperDetector 后置处理 ---
+      // 保证所有消息预处理器执行完成后，再统一应用 Detector 与 SuperDetector；
+      // Role Divider 必须在其后作为最终消息拆分步骤。
+      // Detector 会返回 fresh array；必须显式保护 OneRing 等预处理器挂在数组上的非枚举元数据。
+      const messagesBeforeDetectors = processedMessages;
+      processedMessages = copyArrayMetadata(
+        messagesBeforeDetectors,
+        messageProcessor.applyDetectorsToMessages(processedMessages, processingContext)
+      );
+      if (DEBUG_MODE) await writeDebugLog('LogAfterDetectors', processedMessages);
 
-      // 防御性处理：修复空 assistant 消息，避免上游 API 400 错误
-      // 某些模型（如 reasoning 模型）返回 content: null 时只有 tool_calls/thinking 字段
-      // 直接删除会打乱 user↔assistant 交替顺序，因此改为补充说明性内容
-      processedMessages = processedMessages.map(msg => {
-        if (msg.role === 'assistant') {
-          const content = msg.content;
-          if (content === null || content === undefined || (typeof content === 'string' && content.trim() === '') || (Array.isArray(content) && content.length === 0)) {
-            return { ...msg, content: '...' };
+      // --- 角色分割处理 (Role Divider) - 最终阶段 ---
+      if (enableRoleDivider) {
+        if (DEBUG_MODE) console.log('[Server] Applying Role Divider processing (Final Stage)...');
+        // skipCount: 1 to exclude the initial SystemPrompt from splitting
+        processedMessages = roleDivider.process(processedMessages, {
+          ignoreList: roleDividerIgnoreList,
+          switches: roleDividerSwitches,
+          scanSwitches: roleDividerScanSwitches,
+          removeDisabledTags: roleDividerRemoveDisabledTags,
+          skipCount: 1
+        });
+        if (DEBUG_MODE) await writeDebugLog('LogAfterFinalRoleDivider', processedMessages);
+      }
+
+      // 经过改造后，processedMessages 已经是最终版本，无需再调用 replaceOtherVariables
+      originalBody.messages = processedMessages;
+
+      let oneRingResponseMeta = null;
+      try {
+        const oneRingModule = pluginManager?.messagePreprocessors?.get?.('OneRing');
+        if (oneRingModule && typeof oneRingModule.extractMetaFromMessages === 'function') {
+          oneRingResponseMeta = oneRingModule.extractMetaFromMessages(processedMessages);
+          if (DEBUG_MODE && oneRingResponseMeta) {
+            console.log(`[OneRing] Frozen response meta before upstream fetch: agent=${oneRingResponseMeta.agentName} frontend=${oneRingResponseMeta.frontendSource} turn=${oneRingResponseMeta.turnId || 'none'}`);
           }
         }
-        return msg;
-      });
+      } catch (oneRingMetaError) {
+        console.warn('[OneRing] Failed to freeze response meta before upstream fetch:', oneRingMetaError.message);
+      }
 
-      originalBody.messages = processedMessages;
       const willStreamResponse = isOriginalRequestStreaming;
       const finalUpstreamBody = { ...originalBody, stream: willStreamResponse };
 
@@ -926,6 +1195,8 @@ class ChatCompletionHandler {
           retries: apiRetries,
           delay: apiRetryDelay,
           debugMode: DEBUG_MODE,
+          connectionTimeout: apiConnectionTimeoutMs,
+          modelFallbackCandidates: semanticModelFallbackCandidates,
           onRetry: async (attempt, errorInfo) => {
             if (!res.headersSent && isOriginalRequestStreaming) {
               if (DEBUG_MODE)
@@ -1035,7 +1306,14 @@ class ChatCompletionHandler {
         fetchWithRetry,
         isToolResultError,
         formatToolResult,
-        vcpToolUseForbidden
+        vcpToolUseForbidden,
+        apiConnectionTimeoutMs,
+        semanticModelFallbackCandidates,
+        oneRingResponseMeta,
+        shouldProcessMedia,
+        shouldProcessMediaPlus,
+        isTextOnlyForceTranslateModel,
+        requestPreprocessorConfig
       };
 
       if (isUpstreamStreaming) {
